@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Backend Implementation](#Backend-Implementation)
 - [Key Features](#key-features)
   - [Update Methods](#update-methods)
   - [Security](#security)
@@ -677,6 +678,39 @@ void handleOTAMessage(String topic, String message) {
     }
 }
 ```
+
+## Backend Implementation
+
+To use MQTTOTA in your project, you'll need an MQTT server to manage OTA updates. You can implement your own backend using our reference repository:
+
+**MQTT Broker for OTA Updates**
+- **Repository:** [github.com/Ruben890/Mqtt-Broker](https://github.com/Ruben890/Mqtt-Broker)
+- **Description:** Complete backend for managing OTA updates via MQTT/MQTTS
+- **Features:**
+  - Configurable MQTT server
+  - IoT device management
+  - Firmware update delivery
+  - OTA progress tracking
+  - Error handling and retry mechanisms
+
+**Steps to use the backend:**
+1. Clone the backend repository
+2. Configure the MQTT broker according to your needs
+3. Implement the update delivery logic
+4. Connect your ESP32 devices to the broker
+5. Manage OTA updates from a centralized interface
+
+**Example workflow:**
+```javascript
+// From your backend
+1. Prepare firmware in base64 format
+2. Publish MQTT message to target device
+3. Monitor progress via callbacks
+4. Confirm successful completion
+5. Log results in database
+```
+
+The backend provides a scalable architecture for managing multiple devices simultaneously, with support for mass updates and firmware version management.
 
 ## Contact
 

@@ -1,4 +1,3 @@
-```cpp
 #ifndef MQTT_OTA_SDK_H
 #define MQTT_OTA_SDK_H
 
@@ -11,15 +10,12 @@
 #include "esp_app_format.h"
 #include "esp_partition.h"
 
-
-
 extern "C" {
     #include "libb64/cdecode.h"
     #include "libb64/cencode.h"
 }
 
-
-
+// Default configuration values
 #ifndef MQTT_OTA_BUFFSIZE
 #define MQTT_OTA_BUFFSIZE 1024
 #endif
@@ -48,9 +44,7 @@ extern "C" {
 #define MQTT_OTA_MAX_RETRIES 3        // Maximum retries
 #endif
 
-
 // ENUM AND DATA STRUCTURES
-
 
 // Callbacks for OTA events
 typedef std::function<void(int progress, const String& version)> MQTTOTACallback;
@@ -84,9 +78,7 @@ struct OTAStatistics {
     float averageSpeed = 0.0;  // bytes/second
 };
 
-
 // MAIN MQTTOTA CLASS
-
 
 class MQTTOTA {
 public:
@@ -121,14 +113,14 @@ public:
      */
     void setPartitionName(const String& partitionName = "");
 
-    //  CALLBACKS 
+    // CALLBACKS 
     
     void onProgress(MQTTOTACallback callback);
     void onError(MQTTOTAErrorCallback callback);
     void onSuccess(MQTTOTASuccessCallback callback);
     void onStateChange(MQTTOTAStateCallback callback);
 
-    //  MAIN METHODS 
+    // MAIN METHODS 
     
     void handle();
     void processMessage(const String& topic, const String& message);
@@ -153,9 +145,10 @@ public:
     int getProgress();
     OTAState getCurrentState();
     OTAStatistics getStatistics();
-    size_t getFreeOTASpace();
+    // Temporarily disabled due to compilation error
+    // size_t getFreeOTASpace();
     
-    //  UTILITIES AND DIAGNOSTICS 
+    // UTILITIES AND DIAGNOSTICS 
     
     void printDiagnostics();
     String getBootPartitionInfo();
@@ -165,7 +158,7 @@ public:
     void cleanup();
     void abortUpdate();
     
-    //  MEMORY MANAGEMENT 
+    // MEMORY MANAGEMENT 
     
     static bool checkMemory(size_t requiredBytes);
     static size_t getFreeHeap();
@@ -271,6 +264,9 @@ private:
     bool _checkRollbackProtection();
     bool _verifyImageIntegrity(const uint8_t* data, size_t length);
     bool _validatePartitionWrite();
+    
+    // Helper function for state names
+    String _getStateName(OTAState state);
 };
 
 // Inline method implementations
@@ -314,5 +310,8 @@ inline void MQTTOTA::setMaxRetries(int maxRetries) {
     _otaContext.maxRetries = (maxRetries > 0) ? maxRetries : MQTT_OTA_MAX_RETRIES; 
 }
 
+
+
+
+
 #endif // MQTT_OTA_SDK_H
-```
