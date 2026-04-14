@@ -235,25 +235,23 @@ String getISOTimestamp() {
 String extractMessageFromPayload(const String& message) {
     // This function extracts the actual message from the payload
     // Assumes the message may come inside a JSON object with "Payload" key
-    
-    DynamicJsonDocument doc(32768);
+
+    // v1.1.0: StaticJsonDocument avoids heap fragmentation
+    StaticJsonDocument<4096> doc;
     DeserializationError error = deserializeJson(doc, message);
-    
+
     if (error) {
         Serial.printf("Error parsing JSON to extract payload: %s\n", error.c_str());
         return message; // Return original message if cannot parse
     }
-    
+
     // Check if there is a "Payload" key
     if (doc.containsKey("Payload")) {
-        JsonObject payloadObj = doc["Payload"];
-        DynamicJsonDocument actualDoc(16384);
-        actualDoc.set(payloadObj);
         String actualMessage;
-        serializeJson(actualDoc, actualMessage);
+        serializeJson(doc["Payload"], actualMessage);
         return actualMessage;
     }
-    
+
     // If no "Payload", return original message
     return message;
 }
@@ -303,15 +301,16 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
                 
                 // First try to process as OTA
                 mqttOTA.processMessage(topic, actualMessage);
-                
+
                 // Also check for specific commands
-                DynamicJsonDocument doc(32768);
+                // v1.1.0: StaticJsonDocument on stack — no heap allocation
+                StaticJsonDocument<512> doc;
                 DeserializationError error = deserializeJson(doc, actualMessage);
-                
+
                 if (!error && doc.containsKey("EventType")) {
                     String eventType = doc["EventType"].as<String>();
                     Serial.printf("EventType detected: %s\n", eventType.c_str());
-                    
+
                     if (eventType == "REBOOT") {
                         publishEvent("SYSTEM_REBOOT", "Restart requested by API");
                         delay(1000);
@@ -532,10 +531,16 @@ void setup() {
   // Get device information
   device = getDeviceInfo();
   
-  // Initialize MQTTOTA - topic will be configured dynamically
+  // Initialize MQTTOTA v1.1.0 — topic configured dynamically
   mqttOTA.begin("BasicOTA", FIRMWARE_VERSION);
-  
-  // Configure MQTT for MQTTOTA with dynamic topic
+
+  // --- v1.1.0 Security (optional but recommended for production) ---
+  // Set HMAC-SHA256 key to authenticate incoming firmware payloads.
+  // The sender must sign the decoded firmware bytes with this same key.
+  // mqttOTA.setSecurityKey("your-secret-key-min-32-chars-long");
+  // mqttOTA.requireSignature(true);  // reject unsigned payloads
+
+  // Configure MQTT transport for MQTTOTA
   mqttOTA.setMQTTConfig(
       [](const char* topic, const String& message) {
           publishMQTTMessage(topic, message);
@@ -575,11 +580,14 @@ void loop() {
     // Handle WiFi
     updateWiFiLED();
     updateWiFiStatus();
-    
+
     // Handle button for AP mode
     handleButton();
-    
-    // Handle MQTTOTA
+
+    // v1.1.0 REQUIRED: handle() drives the OTA timeout watchdog and the
+    // non-blocking restart timer after a successful update.
+    // If this is not called every loop iteration the device will NOT restart
+    // automatically after OTA completes.
     mqttOTA.handle();
 
     // Connect MQTT if WiFi is connected
@@ -592,16 +600,16 @@ void loop() {
             }
         }
     }
-    
+
     // Verify and sync time periodically
     verifyAndSyncTime();
-    
+
     // Publish heartbeat periodically (every 5 minutes)
     static unsigned long lastHeartbeat = 0;
-    if (mqttConnected && millis() - lastHeartbeat > 300000) {  // 5 minutes
+    if (mqttConnected && millis() - lastHeartbeat > 300000) {
         publishEvent("HEARTBEAT", "System functioning correctly");
         lastHeartbeat = millis();
     }
-    
+
     delay(10);
 }

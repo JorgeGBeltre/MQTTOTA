@@ -2,955 +2,1191 @@
 #include <Update.h>
 
 extern "C" {
-    #include "libb64/cdecode.h"
-    #include "libb64/cencode.h"
+#include "libb64/cdecode.h"
+#include "libb64/cencode.h"
 }
 
-String MQTTOTA::base64Decode(const String& encoded) {
-    if (ESP.getFreeHeap() < 35000) {
-        Serial.println("Memoria baja antes de decodificar Base64");
-        yield();
-    }
-    
-    String decoded;
-    const char* encodedChars = encoded.c_str();
-    int encodedLength = encoded.length();
-    
-    int maxDecodedSize = (encodedLength * 3) / 4 + 2;
-    
-    if (maxDecodedSize > 50000) {
-        Serial.printf("ERROR: Chunk Base64 demasiado grande: %d bytes\n", maxDecodedSize);
-        return "";
-    }
-    
-    base64_decodestate state;
-    base64_init_decodestate(&state);
-    
-    char* buffer = (char*)malloc(maxDecodedSize);
-    if (!buffer) {
-        Serial.println("ERROR: No se pudo asignar memoria para Base64");
-        return "";
-    }
-    
-    int count = base64_decode_block(encodedChars, encodedLength, buffer, &state);
-    
-    if (count > 0) {
-        decoded = String(buffer, count);
-    } else {
-        Serial.println("ERROR: Decodificación Base64 devolvió 0 bytes");
-    }
-    
-    free(buffer);
-    return decoded;
-} 
+// Base64 helpers (public static)
 
-String MQTTOTA::base64Encode(const String& input) {
-    if (input.isEmpty()) return "";
-    
-    String encoded;
-    const char* inputChars = input.c_str();
-    int inputLength = input.length();
-    
-    int encodedLength = (inputLength + 2) / 3 * 4 + 1;
-    char* buffer = (char*)malloc(encodedLength);
-    if (!buffer) return "";
-    
-    base64_encodestate state;
-    base64_init_encodestate(&state);
-    
-    int count = base64_encode_block(inputChars, inputLength, buffer, &state);
-    count += base64_encode_blockend(buffer + count, &state);
-    
-    encoded = String(buffer, count);
-    free(buffer);
-    return encoded;
+String MQTTOTA::base64Decode(const String &encoded) {
+  if (ESP.getFreeHeap() < 35000) {
+    Serial.println("[MQTTOTA] WARNING: low memory before Base64 decode");
+    yield();
+  }
+
+  const char *encodedChars = encoded.c_str();
+  int encodedLength = encoded.length();
+  int maxDecodedSize = (encodedLength * 3) / 4 + 2;
+
+  if (maxDecodedSize > (int)MQTT_OTA_MAX_CHUNK_SIZE) {
+    Serial.printf("[MQTTOTA] ERROR: Base64 chunk too large: %d bytes\n",
+                  maxDecodedSize);
+    return "";
+  }
+
+  base64_decodestate state;
+  base64_init_decodestate(&state);
+
+  char *buffer = (char *)malloc(maxDecodedSize);
+  if (!buffer) {
+    Serial.println("[MQTTOTA] ERROR: malloc failed for Base64 buffer");
+    return "";
+  }
+
+  int count = base64_decode_block(encodedChars, encodedLength, buffer, &state);
+
+  String decoded;
+  if (count > 0) {
+    decoded = String(buffer, count);
+  } else {
+    Serial.println("[MQTTOTA] ERROR: Base64 decode returned 0 bytes");
+  }
+
+  free(buffer);
+  return decoded;
 }
 
-// Constructor
+String MQTTOTA::base64Encode(const String &input) {
+  if (input.isEmpty())
+    return "";
+
+  const char *inputChars = input.c_str();
+  int inputLength = input.length();
+  int encodedLength = (inputLength + 2) / 3 * 4 + 1;
+
+  char *buffer = (char *)malloc(encodedLength);
+  if (!buffer)
+    return "";
+
+  base64_encodestate state;
+  base64_init_encodestate(&state);
+
+  int count = base64_encode_block(inputChars, inputLength, buffer, &state);
+  count += base64_encode_blockend(buffer + count, &state);
+
+  String encoded = String(buffer, count);
+  free(buffer);
+  return encoded;
+}
+
+// Constructor / Destructor
+
 MQTTOTA::MQTTOTA() {
-    _deviceID = _generateDeviceID();
-    _otaContext.inProgress = false;
-    _otaContext.currentPart = 0;
-    _otaContext.totalParts = 0;
-    _otaContext.receivedSize = 0;
-    _otaContext.update_handle = 0;
-    _otaContext.update_partition = NULL;
-    _otaContext.state = OTA_STATE_IDLE;
-    _otaContext.retryCount = 0;
-    _otaContext.maxRetries = MQTT_OTA_MAX_RETRIES;
+  memset(_hmacKey, 0, sizeof(_hmacKey));
+  _deviceID = _generateDeviceID();
+
+  _otaContext.inProgress = false;
+  _otaContext.currentPart = 0;
+  _otaContext.totalParts = 0;
+  _otaContext.receivedSize = 0;
+  _otaContext.update_handle = 0;
+  _otaContext.update_partition = nullptr;
+  _otaContext.state = OTA_STATE_IDLE;
+  _otaContext.retryCount = 0;
+  _otaContext.maxRetries = MQTT_OTA_MAX_RETRIES;
+  _otaContext.pendingRestart = false;
+  _otaContext.restartAt = 0;
 }
 
-// Destructor
 MQTTOTA::~MQTTOTA() {
-    cleanup();
-    _cleanupChunkedOTA();
+  cleanup();
+  _cleanupChunkedOTA();
 }
 
-// SDK Initialization
-void MQTTOTA::begin(const String& deviceName, const String& firmwareVersion) {
-    _deviceName = deviceName;
-    _firmwareVersion = firmwareVersion;
+// begin()
 
-    Serial.println("MQTTOTA Inicializado");
-    Serial.printf("Dispositivo: %s\n", _deviceName.c_str());
-    Serial.printf("Versión: %s\n", _firmwareVersion.c_str());
-    Serial.printf("ID Dispositivo: %s\n", _deviceID.c_str());
+void MQTTOTA::begin(const String &deviceName, const String &firmwareVersion) {
+  _deviceName = deviceName;
+  _firmwareVersion = firmwareVersion;
+
+  // confirm boot on every start — cancels rollback if in OTA partition
+  if (_otaContext.rollbackEnabled) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && running->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_0 &&
+        running->subtype <= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+      esp_ota_mark_app_valid_cancel_rollback();
+      Serial.println("[MQTTOTA] Boot confirmed — rollback cancelled");
+    }
+  }
+
+  Serial.println("[MQTTOTA] Initialized");
+  Serial.printf("  Device  : %s\n", _deviceName.c_str());
+  Serial.printf("  Version : %s\n", _firmwareVersion.c_str());
+  Serial.printf("  DeviceID: %s\n", _deviceID.c_str());
+  Serial.printf("  Sig req : %s\n", _requireSig ? "YES" : "no");
 }
 
-// MQTT Configuration
+// setMQTTConfig()
+
 void MQTTOTA::setMQTTConfig(
-    std::function<void(const char* topic, const String& message)> publishFunc,
-    std::function<bool()> isConnectedFunc,
-    const String& otaTopic
-) {
-    _publishMQTT = publishFunc;
-    _isMQTTConnected = isConnectedFunc;
-    _otaTopic = otaTopic;
-
-    Serial.printf("MQTT Configurado - Tópico OTA: %s\n", _otaTopic.c_str());
+    std::function<void(const char *topic, const String &message)> publishFunc,
+    std::function<bool()> isConnectedFunc, const String &otaTopic) {
+  _publishMQTT = publishFunc;
+  _isMQTTConnected = isConnectedFunc;
+  _otaTopic = otaTopic;
+  Serial.printf("[MQTTOTA] MQTT configured — topic: %s\n", _otaTopic.c_str());
 }
 
-// Callback Configuration
+// Security configuration
+
+void MQTTOTA::setSecurityKey(const char *key) {
+  if (!key)
+    return;
+  _hmacKeyLen = strlen(key);
+  if (_hmacKeyLen > sizeof(_hmacKey))
+    _hmacKeyLen = sizeof(_hmacKey);
+  memcpy(_hmacKey, key, _hmacKeyLen);
+  Serial.printf("[MQTTOTA] Security key set (%zu bytes)\n", _hmacKeyLen);
+}
+
+void MQTTOTA::requireSignature(bool required) {
+  _requireSig = required;
+  Serial.printf("[MQTTOTA] Signature requirement: %s\n",
+                required ? "ON" : "off");
+}
+
+// Callback registration
+
 void MQTTOTA::onProgress(MQTTOTACallback callback) {
-    _progressCallback = callback;
+  _progressCallback = callback;
 }
-
 void MQTTOTA::onError(MQTTOTAErrorCallback callback) {
-    _errorCallback = callback;
+  _errorCallback = callback;
 }
-
 void MQTTOTA::onSuccess(MQTTOTASuccessCallback callback) {
-    _successCallback = callback;
+  _successCallback = callback;
 }
-
 void MQTTOTA::onStateChange(MQTTOTAStateCallback callback) {
-    _stateChangeCallback = callback;
+  _stateChangeCallback = callback;
 }
 
-// Main Handling
+// handle()  — call every loop()
+
 void MQTTOTA::handle() {
-    // Check timeout
-    if (_otaInProgress && (millis() - _otaStartTime > MQTT_OTA_TIMEOUT_MS)) {
-        _publishError("Timeout en actualización OTA", _currentFirmwareVersion);
-        cleanup();
-        Serial.println("OTA Timeout - Actualización cancelada");
-    }
 
-    if (_otaContext.inProgress && (millis() - _otaContext.startTime > MQTT_OTA_TIMEOUT_MS)) {
-        _publishError("Timeout en OTA por chunks", _otaContext.firmwareVersion);
-        _cleanupChunkedOTA();
-        Serial.println("OTA Chunks Timeout - Actualización cancelada");
+  if (!_otaContext.inProgress && _otaContext.pendingRestart) {
+    unsigned long now = millis();
+
+    if (now >= _otaContext.restartAt ||
+        (now + 10000UL < _otaContext.restartAt)) {
+      Serial.println("[MQTTOTA] Restarting...");
+      ESP.restart();
     }
+    return;
+  }
+
+  // single unified timeout check
+  if (_otaContext.inProgress &&
+      (millis() - _otaContext.startTime > MQTT_OTA_TIMEOUT_MS)) {
+    _publishError("OTA timeout", _otaContext.firmwareVersion);
+    _cleanupChunkedOTA();
+    _setState(OTA_STATE_ERROR);
+    Serial.println("[MQTTOTA] OTA timeout — aborted");
+  }
 }
 
-// MQTT Message Processing
-void MQTTOTA::processMessage(const String& topic, const String& message) {
-    if (topic != _otaTopic) return;
+// processMessage()
 
-    if (isUpdateInProgress()) {
-        Serial.println("OTA en progreso, ignorando nuevo mensaje");
-        return;
-    }
+void MQTTOTA::processMessage(const String &topic, const String &message) {
+  if (topic != _otaTopic)
+    return;
 
-    if (ESP.getFreeHeap() < 30000) {
-        Serial.println("Memoria insuficiente para procesar OTA");
-        return;
-    }
+  if (isUpdateInProgress()) {
+    Serial.println("[MQTTOTA] OTA in progress — ignoring new message");
+    return;
+  }
 
-    Serial.println("Procesando mensaje OTA...");
+  if (ESP.getFreeHeap() < MQTT_OTA_MIN_MEMORY) {
+    Serial.printf("[MQTTOTA] Insufficient memory (%u free, need %d)\n",
+                  ESP.getFreeHeap(), MQTT_OTA_MIN_MEMORY);
+    _publishError("Insufficient memory");
+    return;
+  }
 
-    if (_chunkedOTAEnabled) {
-        _processOTAChunk(message);
-    } else {
-        _processOTAMessage(message);
-    }
+  Serial.println("[MQTTOTA] Processing OTA message...");
+
+  if (_chunkedOTAEnabled) {
+    _processOTAChunk(message);
+  } else {
+    _processOTAMessage(message);
+  }
 }
 
-// Full OTA Processing
-void MQTTOTA::_processOTAMessage(const String& message) {
-    DynamicJsonDocument doc(MQTT_OTA_JSON_SIZE);
-    DeserializationError error = deserializeJson(doc, message);
+// processOTAMessage()  full firmware mode
 
-    if (error) {
-        Serial.printf("Error parseando JSON: %s\n", error.c_str());
-        return;
-    }
+void MQTTOTA::_processOTAMessage(const String &message) {
 
-    if (!doc.containsKey("EventType") || doc["EventType"] != "UpdateFirmwareDevice") {
-        return;
-    }
+  StaticJsonDocument<MQTT_OTA_JSON_SIZE> doc;
+  DeserializationError error = deserializeJson(doc, message);
 
-    if (!doc.containsKey("Details")) {
-        Serial.println("No se encontraron Details en el mensaje");
-        return;
-    }
+  if (error) {
+    Serial.printf("[MQTTOTA] JSON parse error: %s\n", error.c_str());
+    return;
+  }
 
-    JsonObject details = doc["Details"];
-    String firmwareVersion = details["FirmwareVersion"] | "";
-    String base64Data = details["Base64"] | "";
+  if (!doc.containsKey("EventType") ||
+      doc["EventType"] != "UpdateFirmwareDevice") {
+    return;
+  }
 
-    if (firmwareVersion.isEmpty() || base64Data.isEmpty()) {
-        Serial.println("Datos OTA incompletos");
-        return;
-    }
+  if (!doc.containsKey("Details")) {
+    Serial.println("[MQTTOTA] Missing 'Details' in message");
+    return;
+  }
 
-    if (!_validateFirmwareData(base64Data)) {
-        return;
-    }
+  JsonObjectConst details = doc["Details"];
+  String firmwareVersion = details["FirmwareVersion"] | "";
+  String base64Data = details["Base64"] | "";
 
-    Serial.printf("Iniciando OTA - Versión: %s, Tamaño: %d bytes\n",
-                 firmwareVersion.c_str(), base64Data.length());
+  if (firmwareVersion.isEmpty() || base64Data.isEmpty()) {
+    Serial.println("[MQTTOTA] Incomplete OTA data");
+    return;
+  }
 
-    _otaInProgress = true;
-    _otaStartTime = millis();
-    _currentFirmwareVersion = firmwareVersion;
+  if (!_validateFirmwareData(base64Data))
+    return;
 
-    _publishProgress(10, firmwareVersion);
+  _setState(OTA_STATE_RECEIVING);
 
-    if (performUpdate(base64Data, firmwareVersion)) {
-        _publishSuccess(firmwareVersion);
-        Serial.println("OTA Completado - Reiniciando...");
-        delay(2000);
-        ESP.restart();
-    } else {
-        _otaInProgress = false;
-        cleanup();
-    }
-}
+  Serial.printf("[MQTTOTA] Starting full OTA — version: %s, payload: %d B\n",
+                firmwareVersion.c_str(), base64Data.length());
 
-// Chunked OTA Processing
-void MQTTOTA::_processOTAChunk(const String& message) {
-    DynamicJsonDocument doc(4096);
-    DeserializationError error = deserializeJson(doc, message);
+  _otaContext.inProgress = true;
+  _otaContext.startTime = millis();
+  _otaContext.firmwareVersion = firmwareVersion;
 
-    if (error) {
-        Serial.printf("Error parseando JSON OTA: %s\n", error.c_str());
-        return;
-    }
+  _publishProgress(10, firmwareVersion);
+  _setState(OTA_STATE_DECODING);
 
-    if (!doc.containsKey("EventType") || doc["EventType"] != "UpdateFirmwareDevice") {
-        return;
-    }
-
-    if (!doc.containsKey("Details")) {
-        Serial.println("No se encontraron Details en el mensaje OTA");
-        return;
-    }
-
-    JsonObject details = doc["Details"];
-    OTAChunkData chunk;
-
-    chunk.firmwareVersion = details["FirmwareVersion"].as<String>();
-    chunk.base64Part = details["Base64Part"].as<String>();
-    chunk.partIndex = details["PartIndex"].as<int>();
-    chunk.totalParts = details["TotalParts"].as<int>();
-    chunk.isError = details["IsError"] | false;
-    chunk.errorMessage = details["ErrorMessage"] | "";
-
-    if (chunk.isError) {
-        Serial.printf("Error en chunk OTA: %s\n", chunk.errorMessage.c_str());
-        _publishError(chunk.errorMessage, chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    if (chunk.base64Part.isEmpty() || chunk.firmwareVersion.isEmpty()) {
-        _publishError("Chunk OTA incompleto", chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    // First chunk
-    if (chunk.partIndex == 1) {
-        if (_otaContext.inProgress) {
-            Serial.println("OTA en progreso, ignorando nuevo inicio");
-            return;
-        }
-
-        if (!_startChunkedOTA(chunk)) {
-            return;
-        }
-    }
-
-    // Verify sequence
-    if (!_otaContext.inProgress || chunk.partIndex != _otaContext.currentPart + 1) {
-        Serial.printf("Chunk fuera de secuencia. Esperado: %d, Recibido: %d\n",
-                     _otaContext.currentPart + 1, chunk.partIndex);
-        _publishError("Chunk fuera de secuencia", chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    // Process chunk
-    if (!_processChunkData(chunk)) {
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    _otaContext.currentPart = chunk.partIndex;
-    int progress = (chunk.partIndex * 100) / chunk.totalParts;
-    _currentProgress = progress;
-
-    _publishProgress(progress, chunk.firmwareVersion);
-    Serial.printf("Chunk %d/%d procesado. Progreso: %d%%\n",
-                 chunk.partIndex, chunk.totalParts, progress);
-
-    // Last chunk
-    if (chunk.partIndex == chunk.totalParts) {
-        _completeChunkedOTA(chunk);
-    }
-}
-
-// Start Chunked OTA
-bool MQTTOTA::_startChunkedOTA(const OTAChunkData& chunk) {
-    Serial.printf("Iniciando OTA por chunks. Versión: %s, Partes: %d\n",
-                 chunk.firmwareVersion.c_str(), chunk.totalParts);
-
-    esp_err_t err;
-    _otaContext.update_partition = esp_ota_get_next_update_partition(NULL);
-    if (_otaContext.update_partition == NULL) {
-        _publishError("No se pudo encontrar partición OTA", chunk.firmwareVersion);
-        return false;
-    }
-
-    err = esp_ota_begin(_otaContext.update_partition, OTA_WITH_SEQUENTIAL_WRITES, &_otaContext.update_handle);
-    if (err != ESP_OK) {
-        String errorMsg = "Error iniciando OTA: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, chunk.firmwareVersion);
-        return false;
-    }
-
-    _otaContext.inProgress = true;
-    _otaContext.firmwareVersion = chunk.firmwareVersion;
-    _otaContext.currentPart = 0;
-    _otaContext.totalParts = chunk.totalParts;
-    _otaContext.startTime = millis();
-    _otaContext.receivedSize = 0;
-
-    _publishProgress(0, chunk.firmwareVersion);
-    Serial.println("OTA por chunks iniciada");
-    return true;
-}
-
-// Process Chunk Data
-bool MQTTOTA::_processChunkData(const OTAChunkData& chunk) {
-    if (!_otaContext.inProgress || _otaContext.update_handle == 0) {
-        Serial.println("ERROR: OTA no iniciada o handle inválido");
-        _publishError("OTA no iniciada correctamente", chunk.firmwareVersion);
-        return false;
-    }
-
-    String decodedData = base64Decode(chunk.base64Part);
-    if (decodedData.length() == 0) {
-        _publishError("Error decodificando chunk Base64", chunk.firmwareVersion);
-        return false;
-    }
-
-    // Verify header in first chunk
-    if (chunk.partIndex == 1) {
-        if (!_processImageHeader((const uint8_t*)decodedData.c_str(), decodedData.length())) {
-            _publishError("Encabezado de imagen inválido en primer chunk", chunk.firmwareVersion);
-            _cleanupChunkedOTA();
-            return false;
-        }
-        Serial.println("Encabezado de imagen verificado");
-    }
-
-    esp_err_t err = esp_ota_write(_otaContext.update_handle,
-                                 (const void *)decodedData.c_str(),
-                                 decodedData.length());
-
-    if (err != ESP_OK) {
-        String errorMsg = "Error escribiendo chunk OTA: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, chunk.firmwareVersion);
-        return false;
-    }
-
-    _otaContext.receivedSize += decodedData.length();
-
-    Serial.printf("Chunk %d: %d bytes. Total: %d bytes\n",
-                 chunk.partIndex, decodedData.length(), _otaContext.receivedSize);
-
-    return true;
-}
-
-// Complete Chunked OTA
-void MQTTOTA::_completeChunkedOTA(const OTAChunkData& chunk) {
-    Serial.println("Completando OTA por chunks...");
-
-    if (_otaContext.receivedSize < 1000) {
-        _publishError("Firmware demasiado pequeño", chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    _publishProgress(90, chunk.firmwareVersion);
-
-    esp_err_t err = esp_ota_end(_otaContext.update_handle);
-    if (err != ESP_OK) {
-        String errorMsg = "Error finalizando OTA: ";
-        errorMsg += esp_err_to_name(err);
-        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-            errorMsg += " - Validación de imagen falló";
-        }
-        _publishError(errorMsg, chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    _publishProgress(95, chunk.firmwareVersion);
-
-    err = esp_ota_set_boot_partition(_otaContext.update_partition);
-    if (err != ESP_OK) {
-        String errorMsg = "Error estableciendo partición de arranque: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-        return;
-    }
-
-    _publishProgress(100, chunk.firmwareVersion);
-    Serial.println("OTA por chunks completada exitosamente!");
-
-    _publishSuccess(chunk.firmwareVersion);
-
-    Serial.println("Reiniciando en 3 segundos...");
-    delay(3000);
-    ESP.restart();
-}
-
-// Cleanup Chunked OTA
-void MQTTOTA::_cleanupChunkedOTA() {
-    if (_otaContext.inProgress && _otaContext.update_handle != 0) {
-        esp_ota_abort(_otaContext.update_handle);
-        Serial.println("OTA abortada y limpiada");
-    }
+  if (performUpdate(base64Data, firmwareVersion)) {
+    _setState(OTA_STATE_SUCCESS);
+    _publishSuccess(firmwareVersion);
+    Serial.println("[MQTTOTA] Full OTA complete");
 
     _otaContext.inProgress = false;
-    _otaContext.currentPart = 0;
-    _otaContext.totalParts = 0;
-    _otaContext.receivedSize = 0;
-    _otaContext.startTime = 0;
+    _stats.endTime = millis();
+
+    if (_autoReset) {
+      _otaContext.pendingRestart = true;
+      _otaContext.restartAt = millis() + MQTT_OTA_RESTART_DELAY_MS;
+      Serial.printf("[MQTTOTA] Restarting in %lu ms (call handle() in loop)\n",
+                    MQTT_OTA_RESTART_DELAY_MS);
+    }
+  } else {
+    _otaContext.inProgress = false;
+    _setState(OTA_STATE_ERROR);
+    cleanup();
+  }
+}
+
+// processOTAChunk()  chunked mode
+
+void MQTTOTA::_processOTAChunk(const String &message) {
+
+  StaticJsonDocument<4096> doc;
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.printf("[MQTTOTA] JSON chunk parse error: %s\n", error.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("EventType") ||
+      doc["EventType"] != "UpdateFirmwareDevice") {
+    return;
+  }
+
+  if (!doc.containsKey("Details")) {
+    Serial.println("[MQTTOTA] Missing 'Details' in chunk message");
+    return;
+  }
+
+  JsonObjectConst details = doc["Details"];
+  OTAChunkData chunk;
+
+  chunk.firmwareVersion = details["FirmwareVersion"].as<String>();
+  chunk.base64Part = details["Base64Part"].as<String>();
+  chunk.partIndex = details["PartIndex"] | 0;
+  chunk.totalParts = details["TotalParts"] | 0;
+  chunk.isError = details["IsError"] | false;
+  chunk.errorMessage = details["ErrorMessage"] | "";
+
+  if (chunk.isError) {
+    Serial.printf("[MQTTOTA] Sender error: %s\n", chunk.errorMessage.c_str());
+    _publishError(chunk.errorMessage, chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    return;
+  }
+
+  if (chunk.base64Part.isEmpty() || chunk.firmwareVersion.isEmpty()) {
+    _publishError("Incomplete chunk data", chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    return;
+  }
+
+  // First chunk  initialise session
+  if (chunk.partIndex == 1) {
+    if (_otaContext.inProgress) {
+      Serial.println(
+          "[MQTTOTA] OTA already in progress — ignoring new chunk 1");
+      return;
+    }
+    if (!_startChunkedOTA(chunk))
+      return;
+  }
+
+  if (!_otaContext.inProgress ||
+      chunk.partIndex != _otaContext.currentPart + 1) {
+    Serial.printf("[MQTTOTA] Out-of-sequence chunk. Expected %d, got %d\n",
+                  _otaContext.currentPart + 1, chunk.partIndex);
+    _publishError("Chunk out of sequence", chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    return;
+  }
+
+  // Process data
+  if (!_processChunkData(chunk)) {
+    _cleanupChunkedOTA();
+    return;
+  }
+
+  _otaContext.currentPart = chunk.partIndex;
+  int progress = (chunk.partIndex * 100) / chunk.totalParts;
+  _currentProgress = progress;
+
+  _publishProgress(progress, chunk.firmwareVersion);
+  Serial.printf("[MQTTOTA] Chunk %d/%d — %d%% — heap=%u\n", chunk.partIndex,
+                chunk.totalParts, progress, ESP.getFreeHeap());
+
+  // Last chunk
+  if (chunk.partIndex == chunk.totalParts) {
+    _completeChunkedOTA(chunk);
+  }
+}
+
+// startChunkedOTA()
+
+bool MQTTOTA::_startChunkedOTA(const OTAChunkData &chunk) {
+  Serial.printf("[MQTTOTA] Starting chunked OTA — version=%s parts=%d\n",
+                chunk.firmwareVersion.c_str(), chunk.totalParts);
+
+  _setState(OTA_STATE_RECEIVING);
+
+  _otaContext.update_partition = esp_ota_get_next_update_partition(nullptr);
+  if (!_otaContext.update_partition) {
+    _publishError("No OTA partition found", chunk.firmwareVersion);
+    _setState(OTA_STATE_ERROR);
+    return false;
+  }
+
+  esp_err_t err =
+      esp_ota_begin(_otaContext.update_partition, OTA_WITH_SEQUENTIAL_WRITES,
+                    &_otaContext.update_handle);
+  if (err != ESP_OK) {
+    String msg = String("esp_ota_begin failed: ") + esp_err_to_name(err);
+    _publishError(msg, chunk.firmwareVersion);
+    _setState(OTA_STATE_ERROR);
+    return false;
+  }
+
+  _otaContext.inProgress = true;
+  _otaContext.firmwareVersion = chunk.firmwareVersion;
+  _otaContext.currentPart = 0;
+  _otaContext.totalParts = chunk.totalParts;
+  _otaContext.startTime = millis();
+  _otaContext.receivedSize = 0;
+  _otaContext.retryCount = 0;
+  _otaContext.pendingRestart = false;
+
+  _stats.startTime = millis();
+  _stats.chunkCount = 0;
+  _stats.receivedBytes = 0;
+  _stats.totalBytes = 0;
+  _stats.errorCount = 0;
+
+  _publishProgress(0, chunk.firmwareVersion);
+  return true;
+}
+
+// processChunkData()
+
+bool MQTTOTA::_processChunkData(const OTAChunkData &chunk) {
+  if (!_otaContext.inProgress || _otaContext.update_handle == 0) {
+    _publishError("OTA handle invalid", chunk.firmwareVersion);
+    return false;
+  }
+
+  _setState(OTA_STATE_DECODING);
+
+  String decodedData = base64Decode(chunk.base64Part);
+  if (decodedData.length() == 0) {
+    _publishError("Base64 decode error", chunk.firmwareVersion);
+    return false;
+  }
+
+  // Verify image header on first chunk
+  if (chunk.partIndex == 1) {
+    _setState(OTA_STATE_VALIDATING);
+    const uint8_t *raw = (const uint8_t *)decodedData.c_str();
+    if (!_verifyImageIntegrity(raw, decodedData.length())) {
+      _publishError("Invalid firmware image header", chunk.firmwareVersion);
+      return false;
+    }
+    if (!_processImageHeader(raw, decodedData.length())) {
+      _publishError("Firmware header size too small", chunk.firmwareVersion);
+      return false;
+    }
+    Serial.println("[MQTTOTA] Image header OK");
+  }
+
+  _setState(OTA_STATE_WRITING);
+
+  esp_err_t err =
+      esp_ota_write(_otaContext.update_handle,
+                    (const void *)decodedData.c_str(), decodedData.length());
+
+  if (err != ESP_OK) {
+    String msg = String("esp_ota_write failed: ") + esp_err_to_name(err);
+    _publishError(msg, chunk.firmwareVersion);
+    return false;
+  }
+
+  _otaContext.receivedSize += decodedData.length();
+
+  // Update stats
+  unsigned long elapsed = millis() - _otaContext.startTime;
+  if (elapsed > 0) {
+    _stats.avgSpeedBps = (_otaContext.receivedSize * 1000.0f) / (float)elapsed;
+  }
+  _stats.receivedBytes = _otaContext.receivedSize;
+  _stats.chunkCount++;
+
+  Serial.printf("[MQTTOTA] Chunk %d: %d B written, total %zu B\n",
+                chunk.partIndex, decodedData.length(),
+                _otaContext.receivedSize);
+  return true;
+}
+
+// completeChunkedOTA()
+
+void MQTTOTA::_completeChunkedOTA(const OTAChunkData &chunk) {
+  Serial.printf("[MQTTOTA] Completing OTA — %zu bytes written\n",
+                _otaContext.receivedSize);
+
+  _setState(OTA_STATE_COMPLETING);
+
+  if (_otaContext.receivedSize < 1024) {
+    _publishError("Firmware too small", chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    return;
+  }
+
+  _publishProgress(90, chunk.firmwareVersion);
+
+  _setState(OTA_STATE_VALIDATING);
+
+  // SHA-256 / HMAC verification (if checksum provided in chunk)
+  if (!chunk.checksum.isEmpty()) {
+    String computed = _calculateSHA256(
+        (const uint8_t *)chunk.base64Part.c_str(), chunk.base64Part.length());
+    if (!computed.equalsIgnoreCase(chunk.checksum)) {
+      Serial.printf(
+          "[MQTTOTA] SHA-256 mismatch\n  expected: %s\n  computed: %s\n",
+          chunk.checksum.c_str(), computed.c_str());
+      _publishError("SHA-256 mismatch — firmware rejected",
+                    chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    Serial.println("[MQTTOTA] SHA-256 OK");
+  }
+
+  esp_err_t err = esp_ota_end(_otaContext.update_handle);
+  _otaContext.update_handle = 0;
+
+  if (err != ESP_OK) {
+    String msg = String("esp_ota_end failed: ") + esp_err_to_name(err);
+    if (err == ESP_ERR_OTA_VALIDATE_FAILED)
+      msg += " (image validation)";
+    _publishError(msg, chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    _setState(OTA_STATE_ERROR);
+    return;
+  }
+
+  _publishProgress(95, chunk.firmwareVersion);
+
+  err = esp_ota_set_boot_partition(_otaContext.update_partition);
+  if (err != ESP_OK) {
+    String msg =
+        String("esp_ota_set_boot_partition failed: ") + esp_err_to_name(err);
+    _publishError(msg, chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+    _setState(OTA_STATE_ERROR);
+    return;
+  }
+
+  _publishProgress(100, chunk.firmwareVersion);
+
+  _setState(OTA_STATE_SUCCESS);
+  _publishSuccess(chunk.firmwareVersion);
+
+  _stats.endTime = millis();
+  _stats.lastState = OTA_STATE_SUCCESS;
+
+  Serial.printf("[MQTTOTA] OTA SUCCESS — %s in %.1f s\n",
+                chunk.firmwareVersion.c_str(),
+                (millis() - _otaContext.startTime) / 1000.0f);
+
+  _otaContext.inProgress = false;
+
+  // non-blocking restart
+  if (_autoReset) {
+    _otaContext.pendingRestart = true;
+    _otaContext.restartAt = millis() + MQTT_OTA_RESTART_DELAY_MS;
+    Serial.printf("[MQTTOTA] Restarting in %lu ms (call handle() in loop)\n",
+                  MQTT_OTA_RESTART_DELAY_MS);
+  }
+}
+
+// cleanupChunkedOTA()
+
+void MQTTOTA::_cleanupChunkedOTA() {
+  if (_otaContext.update_handle != 0) {
+    if (_otaContext.inProgress) {
+      esp_ota_abort(_otaContext.update_handle);
+      Serial.println("[MQTTOTA] OTA aborted");
+    }
     _otaContext.update_handle = 0;
-    _otaContext.update_partition = NULL;
+  }
+
+  _otaContext.inProgress = false;
+  _otaContext.currentPart = 0;
+  _otaContext.totalParts = 0;
+  _otaContext.receivedSize = 0;
+  _otaContext.startTime = 0;
+  _otaContext.update_partition = nullptr;
+  _otaContext.retryCount = 0;
+  _otaContext.pendingRestart = false;
+  _currentProgress = 0;
+
+  _setState(OTA_STATE_IDLE);
 }
 
-// Execute Full OTA Update
-bool MQTTOTA::performUpdate(const String& base64Data, const String& firmwareVersion) {
-    return _performOTAUpdateESPIDF(base64Data, firmwareVersion);
+// performUpdate() / performOTAUpdateESPIDF()
+
+bool MQTTOTA::performUpdate(const String &base64Data,
+                            const String &firmwareVersion) {
+  return _performOTAUpdateESPIDF(base64Data, firmwareVersion);
 }
 
-// ESP-IDF OTA Implementation
-bool MQTTOTA::_performOTAUpdateESPIDF(const String& base64Data, const String& firmwareVersion) {
-    Serial.println("Iniciando actualización OTA con ESP-IDF...");
+bool MQTTOTA::_performOTAUpdateESPIDF(const String &base64Data,
+                                      const String &firmwareVersion) {
+  Serial.println("[MQTTOTA] Starting full OTA with ESP-IDF...");
 
-    if (ESP.getFreeHeap() < 50000) {
-        _publishError("Memoria insuficiente para OTA", firmwareVersion);
+  if (ESP.getFreeHeap() < 50000) {
+    _publishError("Insufficient memory for full OTA", firmwareVersion);
+    return false;
+  }
+
+  _setState(OTA_STATE_DECODING);
+
+  String decodedData = base64Decode(base64Data);
+  if (decodedData.length() == 0) {
+    _publishError("Base64 decode failed", firmwareVersion);
+    return false;
+  }
+
+  Serial.printf("[MQTTOTA] Decoded: %d B, free heap: %u\n",
+                decodedData.length(), ESP.getFreeHeap());
+
+  const esp_partition_t *update_partition =
+      esp_ota_get_next_update_partition(nullptr);
+  if (!update_partition) {
+    _publishError("No OTA partition found", firmwareVersion);
+    return false;
+  }
+
+  esp_ota_handle_t update_handle;
+  esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES,
+                                &update_handle);
+  if (err != ESP_OK) {
+    _publishError(String("esp_ota_begin failed: ") + esp_err_to_name(err),
+                  firmwareVersion);
+    return false;
+  }
+
+  _publishProgress(25, firmwareVersion);
+
+  size_t total = decodedData.length();
+  size_t written = 0;
+  size_t chunk_size = _chunkSize;
+
+  for (size_t i = 0; i < total; i += chunk_size) {
+    size_t csz = min(chunk_size, total - i);
+
+    if (i == 0) {
+      _setState(OTA_STATE_VALIDATING);
+      const uint8_t *raw = (const uint8_t *)decodedData.c_str();
+      if (!_processImageHeader(raw, csz)) {
+        esp_ota_abort(update_handle);
+        _publishError("Invalid firmware image header", firmwareVersion);
         return false;
+      }
+      if (!_verifyImageIntegrity(raw, csz)) {
+        esp_ota_abort(update_handle);
+        _publishError("Firmware magic number invalid", firmwareVersion);
+        return false;
+      }
     }
 
-    String decodedData = base64Decode(base64Data);
-    if (decodedData.length() == 0) {
-        _publishError("Error decodificando Base64", firmwareVersion);
-        return false;
-    }
+    _setState(OTA_STATE_WRITING);
 
-    Serial.printf("Firmware decodificado: %d bytes, Memoria libre: %d\n",
-                 decodedData.length(), ESP.getFreeHeap());
-
-    esp_err_t err;
-    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
-    if (update_partition == NULL) {
-        _publishError("No se pudo encontrar partición OTA", firmwareVersion);
-        return false;
-    }
-
-    esp_ota_handle_t update_handle;
-    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    err = esp_ota_write(update_handle, (const void *)(decodedData.c_str() + i),
+                        csz);
     if (err != ESP_OK) {
-        String errorMsg = "Error iniciando OTA: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, firmwareVersion);
-        return false;
+      esp_ota_abort(update_handle);
+      _publishError(String("esp_ota_write failed: ") + esp_err_to_name(err),
+                    firmwareVersion);
+      return false;
     }
 
-    _publishProgress(25, firmwareVersion);
+    written += csz;
 
-    size_t total_size = decodedData.length();
-    size_t bytes_written = 0;
-    size_t chunk_size = _chunkSize;
+    int progress = 25 + (int)(written * 50 / total);
+    if (progress > 75)
+      progress = 75;
+    if ((written * 100 / total) % 10 == 0)
+      _publishProgress(progress, firmwareVersion);
 
-    for (size_t i = 0; i < total_size; i += chunk_size) {
-        size_t current_chunk_size = min(chunk_size, total_size - i);
+    Serial.printf("[MQTTOTA] Written %zu / %zu B (%.1f%%)\n", written, total,
+                  written * 100.0 / total);
+  }
 
-        if (i == 0 && !_processImageHeader((const uint8_t*)decodedData.c_str(), current_chunk_size)) {
-            esp_ota_abort(update_handle);
-            _publishError("Encabezado de imagen inválido", firmwareVersion);
-            return false;
-        }
+  _publishProgress(75, firmwareVersion);
+  _setState(OTA_STATE_COMPLETING);
 
-        err = esp_ota_write(update_handle,
-                           (const void *)(decodedData.c_str() + i),
-                           current_chunk_size);
+  err = esp_ota_end(update_handle);
+  if (err != ESP_OK) {
+    _publishError(String("esp_ota_end failed: ") + esp_err_to_name(err),
+                  firmwareVersion);
+    return false;
+  }
 
-        if (err != ESP_OK) {
-            esp_ota_abort(update_handle);
-            String errorMsg = "Error escribiendo OTA: ";
-            errorMsg += esp_err_to_name(err);
-            _publishError(errorMsg, firmwareVersion);
-            return false;
-        }
+  err = esp_ota_set_boot_partition(update_partition);
+  if (err != ESP_OK) {
+    _publishError(String("esp_ota_set_boot_partition failed: ") +
+                      esp_err_to_name(err),
+                  firmwareVersion);
+    return false;
+  }
 
-        bytes_written += current_chunk_size;
+  _publishProgress(100, firmwareVersion);
+  Serial.println("[MQTTOTA] Full OTA complete");
+  return true;
+}
 
-        int progress = 25 + (bytes_written * 50 / total_size);
-        if (progress > 75) progress = 75;
+// validateFirmwareData()
 
-        if ((bytes_written * 100 / total_size) % 10 == 0) {
-            _publishProgress(progress, firmwareVersion);
-        }
-
-        Serial.printf("Escritos %d bytes de %d (%.1f%%)\n",
-                     bytes_written, total_size, (bytes_written * 100.0 / total_size));
+bool MQTTOTA::_validateFirmwareData(const String &base64Data) {
+  if (base64Data.isEmpty()) {
+    _publishError("Empty firmware data");
+    return false;
+  }
+  if (base64Data.length() < 100) {
+    _publishError("Firmware data too short");
+    return false;
+  }
+  for (unsigned int i = 0; i < base64Data.length(); i++) {
+    char c = base64Data.charAt(i);
+    if (!isalnum(c) && c != '+' && c != '/' && c != '=' && c != '\n' &&
+        c != '\r') {
+      _publishError("Invalid Base64 character");
+      return false;
     }
-
-    _publishProgress(75, firmwareVersion);
-
-    err = esp_ota_end(update_handle);
-    if (err != ESP_OK) {
-        String errorMsg = "Error finalizando OTA: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, firmwareVersion);
-        return false;
-    }
-
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        String errorMsg = "Error estableciendo partición de arranque: ";
-        errorMsg += esp_err_to_name(err);
-        _publishError(errorMsg, firmwareVersion);
-        return false;
-    }
-
-    Serial.println("OTA completado exitosamente!");
-    _publishProgress(100, firmwareVersion);
-
-    return true;
+  }
+  return true;
 }
 
-// Validate Firmware Data
-bool MQTTOTA::_validateFirmwareData(const String& base64Data) {
-    if (base64Data.isEmpty()) {
-        _publishError("Datos de firmware vacíos");
-        return false;
-    }
+// Publishing helpers  (StaticJsonDocument)
 
-    if (base64Data.length() < 100) {
-        _publishError("Datos de firmware demasiado cortos");
-        return false;
-    }
+void MQTTOTA::_publishError(const String &errorMessage,
+                            const String &firmwareVersion) {
+  _stats.errorCount++;
 
-    for (unsigned int i = 0; i < base64Data.length(); i++) {
-        char c = base64Data.charAt(i);
-        if (!isalnum(c) && c != '+' && c != '/' && c != '=' && c != '\n' && c != '\r') {
-            _publishError("Formato Base64 inválido");
-            return false;
-        }
-    }
+  if (_errorCallback) {
+    _errorCallback(errorMessage, firmwareVersion.isEmpty() ? _firmwareVersion
+                                                           : firmwareVersion);
+  }
 
-    return true;
+  Serial.printf("[MQTTOTA] ERROR: %s\n", errorMessage.c_str());
+
+  if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
+    StaticJsonDocument<256> doc;
+    doc["device"] = _deviceID;
+    doc["version"] =
+        firmwareVersion.isEmpty() ? _firmwareVersion : firmwareVersion;
+    doc["error"] = errorMessage;
+    doc["timestamp"] = millis();
+
+    String output;
+    serializeJson(doc, output);
+    _publishMQTT("ota/error", output);
+  }
 }
 
-// Publish Errors
-void MQTTOTA::_publishError(const String& errorMessage, const String& firmwareVersion) {
-    if (_errorCallback) {
-        _errorCallback(errorMessage, firmwareVersion.isEmpty() ? _firmwareVersion : firmwareVersion);
-    }
+void MQTTOTA::_publishSuccess(const String &firmwareVersion) {
+  if (_successCallback)
+    _successCallback(firmwareVersion);
 
-    if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
-        DynamicJsonDocument doc(2048);
-        doc["device"] = _deviceID;
-        doc["version"] = firmwareVersion.isEmpty() ? _firmwareVersion : firmwareVersion;
-        doc["error"] = errorMessage;
-        doc["timestamp"] = millis();
+  if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
+    StaticJsonDocument<256> doc;
+    doc["device"] = _deviceID;
+    doc["version"] = firmwareVersion;
+    doc["success"] = true;
+    doc["timestamp"] = millis();
 
-        String output;
-        serializeJson(doc, output);
-        _publishMQTT("ota/error", output);
-    }
+    String output;
+    serializeJson(doc, output);
+    _publishMQTT("ota/success", output);
+  }
 
-    Serial.printf("Error OTA: %s\n", errorMessage.c_str());
+  Serial.printf("[MQTTOTA] SUCCESS — version: %s\n", firmwareVersion.c_str());
 }
 
-// Publish Success
-void MQTTOTA::_publishSuccess(const String& firmwareVersion) {
-    if (_successCallback) {
-        _successCallback(firmwareVersion);
-    }
+void MQTTOTA::_publishProgress(int progress, const String &firmwareVersion) {
+  _currentProgress = progress;
 
-    if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
-        DynamicJsonDocument doc(2048);
-        doc["device"] = _deviceID;
-        doc["version"] = firmwareVersion;
-        doc["success"] = true;
-        doc["timestamp"] = millis();
+  if (_progressCallback)
+    _progressCallback(progress, firmwareVersion);
 
-        String output;
-        serializeJson(doc, output);
-        _publishMQTT("ota/success", output);
-    }
+  if (_publishMQTT && _isMQTTConnected && _isMQTTConnected() &&
+      (progress % 10 == 0 || progress == 100)) {
+    StaticJsonDocument<256> doc;
+    doc["device"] = _deviceID;
+    doc["version"] = firmwareVersion;
+    doc["progress"] = progress;
+    doc["timestamp"] = millis();
 
-    Serial.printf("OTA Exitoso - Versión: %s\n", firmwareVersion.c_str());
-}
+    String output;
+    serializeJson(doc, output);
+    _publishMQTT("ota/progress", output);
+  }
 
-// Publish Progress
-void MQTTOTA::_publishProgress(int progress, const String& firmwareVersion) {
-    _currentProgress = progress;
-
-    if (_progressCallback) {
-        _progressCallback(progress, firmwareVersion);
-    }
-
-    if (_publishMQTT && _isMQTTConnected && _isMQTTConnected() && (progress % 10 == 0 || progress == 100)) {
-        DynamicJsonDocument doc(1024);
-        doc["device"] = _deviceID;
-        doc["version"] = firmwareVersion;
-        doc["progress"] = progress;
-        doc["timestamp"] = millis();
-
-        String output;
-        serializeJson(doc, output);
-        _publishMQTT("ota/progress", output);
-    }
-
-    Serial.printf("Progreso OTA: %d%%\n", progress);
-}
-
-// Cleanup
-void MQTTOTA::cleanup() {
-    _otaInProgress = false;
-    _currentProgress = 0;
-    _otaStartTime = 0;
-    _currentFirmwareVersion = "";
-}
-
-// Generate Device ID
-String MQTTOTA::_generateDeviceID() {
-    uint64_t chipID = ESP.getEfuseMac();
-    char chipIdStr[17];
-    snprintf(chipIdStr, sizeof(chipIdStr), "%04X%08X",
-             (uint16_t)(chipID >> 32), (uint32_t)chipID);
-    return String(chipIdStr);
-}
-
-// Internal Utilities
-void MQTTOTA::_printSHA256(const uint8_t *image_hash, const char *label) {
-    char hash_print[MQTT_OTA_HASH_LEN * 2 + 1];
-    hash_print[MQTT_OTA_HASH_LEN * 2] = 0;
-    for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
-        sprintf(&hash_print[i * 2], "%02x", image_hash[i]);
-    }
-    Serial.printf("%s: %s\n", label, hash_print);
-}
-
-bool MQTTOTA::_processImageHeader(const uint8_t *data, size_t data_len) {
-    if (data_len < sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
-        Serial.println("Paquete recibido no tiene longitud suficiente para encabezado");
-        return false;
-    }
-
-    esp_app_desc_t new_app_info;
-    memcpy(&new_app_info, &data[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t));
-
-    Serial.printf("Nueva versión de firmware: %s\n", new_app_info.version);
-    return true;
-}
-
-void MQTTOTA::setPartitionName(const String& partitionName) {
-    _otaContext.partitionName = partitionName;
-}
-
-OTAState MQTTOTA::getCurrentState() {
-    return _otaContext.state;
-}
-
-OTAStatistics MQTTOTA::getStatistics() {
-    return _stats;
-}
-/*
-size_t MQTTOTA::getFreeOTASpace() {
-    const esp_partition_t* partition = esp_ota_get_next_update_partition(NULL);
-    if (partition == NULL) return 0;
-    
-    esp_ota_handle_t handle;
-    esp_err_t err = esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &handle);
-    if (err != ESP_OK) return 0;
-    
-    size_t free_space = 0;
-    esp_ota_get_partition_description(partition, &free_space);
-    esp_ota_abort(handle);
-    
-    return free_space;
-}
-*/
-
-void MQTTOTA::printDiagnostics() {
-    Serial.println("=== Diagnósticos MQTTOTA ===");
-    Serial.printf("ID Dispositivo: %s\n", _deviceID.c_str());
-    Serial.printf("Firmware: %s\n", _firmwareVersion.c_str());
-    Serial.printf("Memoria Libre: %d bytes\n", ESP.getFreeHeap());
-    Serial.printf("OTA en progreso: %s\n", isUpdateInProgress() ? "Sí" : "No");
-    Serial.printf("Progreso actual: %d%%\n", _currentProgress);
-    
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (running) {
-        Serial.printf("Partición actual: %s (0x%08X)\n", 
-                     running->label, running->address);
-    }
-}
-
-String MQTTOTA::getBootPartitionInfo() {
-    const esp_partition_t* boot_partition = esp_ota_get_boot_partition();
-    if (!boot_partition) return "Desconocido";
-    
-    char buffer[256];
-    snprintf(buffer, sizeof(buffer), 
-             "Etiqueta: %s, Tipo: %d, Subtipo: %d, Dirección: 0x%08X, Tamaño: %d",
-             boot_partition->label,
-             boot_partition->type,
-             boot_partition->subtype,
-             boot_partition->address,
-             boot_partition->size);
-    return String(buffer);
-}
-
-size_t MQTTOTA::calculateBase64DecodedSize(const String& encoded) {
-    size_t len = encoded.length();
-    size_t padding = 0;
-    
-    if (len > 0 && encoded.charAt(len - 1) == '=') padding++;
-    if (len > 1 && encoded.charAt(len - 2) == '=') padding++;
-    
-    return (len * 3) / 4 - padding;
-}
-
-void MQTTOTA::abortUpdate() {
-    if (isUpdateInProgress()) {
-        _publishError("Actualización abortada por usuario", _currentFirmwareVersion);
-        _cleanupChunkedOTA();
-        cleanup();
-        _setState(OTA_STATE_ABORTED);
-        Serial.println("Actualización OTA abortada");
-    }
-}
-
-bool MQTTOTA::checkMemory(size_t requiredBytes) {
-    size_t freeHeap = ESP.getFreeHeap();
-    bool hasEnoughMemory = (freeHeap >= requiredBytes + MQTT_OTA_MIN_MEMORY);
-    
-    if (!hasEnoughMemory) {
-        Serial.printf("Memoria insuficiente: %d bytes disponibles, %d bytes requeridos\n",
-                     freeHeap, requiredBytes + MQTT_OTA_MIN_MEMORY);
-    }
-    
-    return hasEnoughMemory;
-}
-
-size_t MQTTOTA::getFreeHeap() {
-    return ESP.getFreeHeap();
-}
-
-void MQTTOTA::logMemoryStatus() {
-    Serial.printf("Estado de Memoria - Libre: %d, Mínimo Libre: %d, Máximo Asignable: %d\n",
-                 ESP.getFreeHeap(),
-                 ESP.getMinFreeHeap(),
-                 ESP.getMaxAllocHeap());
-}
-
-bool MQTTOTA::verifyFirmwareSignature(const String& signature) {
-    if (signature.isEmpty()) {
-        Serial.println("Advertencia: No se proporcionó firma para verificación");
-        return true; // Permitir sin firma si no se requiere
-    }
-    
-    Serial.printf("Verificación de firma solicitada: %s\n", signature.c_str());
-    return true;
-}
-
-bool MQTTOTA::checkFirmwareCompatibility(const String& newVersion) {
-    if (newVersion.isEmpty()) return false;
-    
-    int dots = 0;
-    for (size_t i = 0; i < newVersion.length(); i++) {
-        char c = newVersion.charAt(i);
-        if (c == '.') dots++;
-        else if (!isdigit(c) && c != '-' && c != '+') return false;
-    }
-    
-    return (dots >= 1 && dots <= 2);
-}
-
-bool MQTTOTA::_validateChecksum(const String& data, const String& checksum) {
-    if (checksum.isEmpty()) return true;
-    
-    Serial.printf("Validación de checksum: Longitud datos=%d, Checksum=%s\n",
-                 data.length(), checksum.c_str());
-    return true;
-}
-
-void MQTTOTA::_handleChunkError(const OTAChunkData& chunk, const String& error) {
-    Serial.printf("Error en chunk %d: %s\n", chunk.partIndex, error.c_str());
-    
-    _otaContext.retryCount++;
-    if (_otaContext.retryCount <= _otaContext.maxRetries) {
-        Serial.printf("Reintentando chunk %d (intento %d/%d)\n",
-                     chunk.partIndex, _otaContext.retryCount, _otaContext.maxRetries);
-      
-    } else {
-        _publishError("Máximo de reintentos excedido para chunk: " + error, chunk.firmwareVersion);
-        _cleanupChunkedOTA();
-    }
+  Serial.printf("[MQTTOTA] Progress: %d%%\n", progress);
 }
 
 void MQTTOTA::_publishStateChange(OTAState state) {
-    if (_stateChangeCallback) {
-        _stateChangeCallback(static_cast<uint8_t>(state));
-    }
-    
-    if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
-        DynamicJsonDocument doc(512);
-        doc["device"] = _deviceID;
-        doc["state"] = static_cast<uint8_t>(state);
-        doc["state_name"] = _getStateName(state);
-        doc["timestamp"] = millis();
-        
-        String output;
-        serializeJson(doc, output);
-        _publishMQTT("ota/state", output);
-    }
-    
-    Serial.printf("Estado OTA cambiado a: %s\n", _getStateName(state).c_str());
+  if (_stateChangeCallback)
+    _stateChangeCallback(static_cast<uint8_t>(state));
+
+  if (_publishMQTT && _isMQTTConnected && _isMQTTConnected()) {
+    StaticJsonDocument<256> doc;
+    doc["device"] = _deviceID;
+    doc["state"] = static_cast<uint8_t>(state);
+    doc["state_name"] = _getStateName(state);
+    doc["timestamp"] = millis();
+
+    String output;
+    serializeJson(doc, output);
+    _publishMQTT("ota/state", output);
+  }
+
+  Serial.printf("[MQTTOTA] State → %s\n", _getStateName(state).c_str());
 }
 
-String MQTTOTA::_calculateSHA256(const uint8_t* data, size_t length) {
+// cleanup() / abortUpdate()
+
+void MQTTOTA::cleanup() {
+  _otaContext.inProgress = false;
+  _currentProgress = 0;
+  _otaContext.startTime = 0;
+  _otaContext.firmwareVersion = "";
+  _otaContext.pendingRestart = false;
+}
+
+void MQTTOTA::abortUpdate() {
+  if (isUpdateInProgress()) {
+    _publishError("Aborted by user", _otaContext.firmwareVersion);
+    _cleanupChunkedOTA();
+    cleanup();
+    _setState(OTA_STATE_ABORTED);
+    Serial.println("[MQTTOTA] Update aborted by user");
+  }
+}
+
+// SHA-256  (implementation with mbedtls)
+
+String MQTTOTA::_calculateSHA256(const uint8_t *data, size_t length) {
+  uint8_t digest[MQTT_OTA_HASH_LEN];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0); // 0 = SHA-256 (not SHA-224)
+  mbedtls_sha256_update(&ctx, data, length);
+  mbedtls_sha256_finish(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
+
+  char hex[MQTT_OTA_HASH_LEN * 2 + 1];
+  for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
+    snprintf(&hex[i * 2], 3, "%02x", digest[i]);
+  }
+  return String(hex);
+}
+
+// HMAC-SHA256
+
+String MQTTOTA::_hmacSha256Hex(const uint8_t *data, size_t len) const {
+  if (_hmacKeyLen == 0)
     return "";
+
+  uint8_t digest[MQTT_OTA_HASH_LEN];
+  const mbedtls_md_info_t *mdInfo =
+      mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  mbedtls_md_hmac(mdInfo, _hmacKey, _hmacKeyLen, data, len, digest);
+
+  char hex[MQTT_OTA_HASH_LEN * 2 + 1];
+  for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
+    snprintf(&hex[i * 2], 3, "%02x", digest[i]);
+  }
+  return String(hex);
 }
 
-void MQTTOTA::_setState(OTAState state) {
-    if (_otaContext.state != state) {
-        _otaContext.state = state;
-        _publishStateChange(state);
+// New public overload: raw bytes + expected hex
+bool MQTTOTA::verifyFirmwareSignature(const uint8_t *data, size_t len,
+                                      const String &expectedHex) {
+  if (expectedHex.isEmpty()) {
+    if (_requireSig) {
+      Serial.println("[MQTTOTA] ERROR: signature required but not provided");
+      return false;
     }
+    return true;
+  }
+  if (_hmacKeyLen == 0) {
+    Serial.println(
+        "[MQTTOTA] WARNING: signature provided but no key set — skipping");
+    return true;
+  }
+
+  String computed = _hmacSha256Hex(data, len);
+  bool ok = computed.equalsIgnoreCase(expectedHex);
+
+  if (!ok) {
+    Serial.printf("[MQTTOTA] HMAC mismatch\n  expected: %s\n  computed: %s\n",
+                  expectedHex.c_str(), computed.c_str());
+  } else {
+    Serial.println("[MQTTOTA] HMAC OK");
+  }
+  return ok;
 }
 
-void MQTTOTA::_updateStatistics(size_t bytesReceived, bool isError) {
-    if (_stats.startTime == 0 && bytesReceived > 0) {
-        _stats.startTime = millis();
+// Legacy overload: kept for backward compatibility (does nothing useful without
+// data)
+bool MQTTOTA::verifyFirmwareSignature(const String &signature) {
+  if (signature.isEmpty()) {
+    if (_requireSig) {
+      Serial.println("[MQTTOTA] ERROR: signature required but not provided");
+      return false;
     }
-    
-    if (bytesReceived > 0) {
-        _stats.totalBytes += bytesReceived;
-        _stats.receivedBytes += bytesReceived;
-        _stats.chunkCount++;
-        
-        if (_stats.startTime > 0) {
-            unsigned long elapsed = millis() - _stats.startTime;
-            if (elapsed > 1000) {
-                _stats.averageSpeed = (_stats.receivedBytes * 1000.0) / elapsed;
-            }
-        }
-    }
-    
-    if (isError) {
-        _stats.errorCount++;
-    }
-    
-    _stats.lastState = _otaContext.state;
+    Serial.println("[MQTTOTA] WARNING: no signature provided");
+    return true;
+  }
+  // Without raw data we cannot compute HMAC — accept if a key is not set
+  if (_hmacKeyLen == 0)
+    return true;
+  Serial.println("[MQTTOTA] WARNING: use verifyFirmwareSignature(data, len, "
+                 "hex) for HMAC check");
+  return true;
 }
 
-bool MQTTOTA::_checkFirmwareVersion(const String& newVersion) {
-    if (!_otaContext.versionCheckEnabled) return true;
-    
-    return (newVersion != _firmwareVersion);
+// getFreeOTASpace()
+
+size_t MQTTOTA::getFreeOTASpace() {
+  const esp_partition_t *part = esp_ota_get_next_update_partition(nullptr);
+  if (!part)
+    return 0;
+  return (size_t)part->size;
+}
+
+// processImageHeader() / verifyImageIntegrity()
+
+bool MQTTOTA::_processImageHeader(const uint8_t *data, size_t data_len) {
+  const size_t minLen = sizeof(esp_image_header_t) +
+                        sizeof(esp_image_segment_header_t) +
+                        sizeof(esp_app_desc_t);
+  if (data_len < minLen) {
+    Serial.printf("[MQTTOTA] First chunk too small: %zu < %zu\n", data_len,
+                  minLen);
+    return false;
+  }
+
+  esp_app_desc_t appDesc;
+  memcpy(&appDesc,
+         data + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t),
+         sizeof(esp_app_desc_t));
+  Serial.printf("[MQTTOTA] Firmware version: %s  IDF: %s\n", appDesc.version,
+                appDesc.idf_ver);
+  return true;
+}
+
+bool MQTTOTA::_verifyImageIntegrity(const uint8_t *data, size_t length) {
+  if (length < sizeof(esp_image_header_t))
+    return false;
+
+  const esp_image_header_t *header = (const esp_image_header_t *)data;
+
+  if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
+    Serial.printf("[MQTTOTA] Bad magic: 0x%02X (expected 0x%02X)\n",
+                  header->magic, ESP_IMAGE_HEADER_MAGIC);
+    return false;
+  }
+  if (header->segment_count == 0) {
+    Serial.println("[MQTTOTA] Zero segments in image");
+    return false;
+  }
+  return true;
+}
+
+// Partition validation
+
+bool MQTTOTA::_validatePartitionWrite() {
+  if (!_otaContext.update_partition)
+    return false;
+
+  if (_otaContext.update_partition->type != ESP_PARTITION_TYPE_APP) {
+    Serial.println("[MQTTOTA] Partition type is not APP");
+    return false;
+  }
+  if (_otaContext.update_partition->size < 65536) {
+    Serial.printf("[MQTTOTA] Partition too small: %u B\n",
+                  _otaContext.update_partition->size);
+    return false;
+  }
+  Serial.printf("[MQTTOTA] Partition OK: %s @ 0x%08X (%u B)\n",
+                _otaContext.update_partition->label,
+                _otaContext.update_partition->address,
+                _otaContext.update_partition->size);
+  return true;
+}
+
+// Version / rollback helpers
+
+bool MQTTOTA::_checkFirmwareVersion(const String &newVersion) {
+  if (!_otaContext.versionCheckEnabled)
+    return true;
+  return (newVersion != _firmwareVersion && !newVersion.isEmpty());
 }
 
 bool MQTTOTA::_checkRollbackProtection() {
-    if (!_otaContext.rollbackEnabled) return true;
-    
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (!running) return false;
-    
+  if (!_otaContext.rollbackEnabled)
     return true;
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  return (running != nullptr);
 }
 
-bool MQTTOTA::_verifyImageIntegrity(const uint8_t* data, size_t length) {
-    if (length < sizeof(esp_image_header_t)) {
-        return false;
-    }
-    
-    const esp_image_header_t* header = (const esp_image_header_t*)data;
-    
-    if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
-        Serial.println("Número mágico de imagen inválido");
-        return false;
-    }
-    
-    if (header->segment_count == 0) {
-        Serial.println("No hay segmentos en la imagen");
-        return false;
-    }
-    
-    return true;
+// State management
+
+void MQTTOTA::_setState(OTAState state) {
+  if (_otaContext.state == state)
+    return;
+  _otaContext.state = state;
+  _stats.lastState = state;
+  _publishStateChange(state);
 }
 
-bool MQTTOTA::_validatePartitionWrite() {
-    if (_otaContext.update_partition == NULL) {
-        return false;
+// Statistics
+
+void MQTTOTA::_updateStatistics(size_t bytesReceived, bool isError) {
+  if (_stats.startTime == 0 && bytesReceived > 0) {
+    _stats.startTime = millis();
+  }
+  if (bytesReceived > 0) {
+    _stats.totalBytes += bytesReceived;
+    _stats.receivedBytes += bytesReceived;
+    _stats.chunkCount++;
+
+    unsigned long elapsed = millis() - _stats.startTime;
+    if (elapsed > 1000) {
+      _stats.averageSpeed = (_stats.receivedBytes * 1000.0f) / elapsed;
     }
-    
-    // Verifica que la partición sea de tipo APP
-    if (_otaContext.update_partition->type != ESP_PARTITION_TYPE_APP) {
-        Serial.println("Tipo de partición inválido para OTA");
-        return false;
-    }
-    
-    // CORREGIDO: Usar propiedad size directamente en lugar de esp_partition_get_info()
-    if (_otaContext.update_partition->size < 1024) { // Tamaño mínimo razonable
-        Serial.printf("Partición demasiado pequeña para firmware: %u bytes\n", _otaContext.update_partition->size);
-        return false;
-    }
-    
-    Serial.printf("Partición válida: %s, dirección: 0x%08X, tamaño: %u bytes\n",
+  }
+  if (isError)
+    _stats.errorCount++;
+  _stats.lastState = _otaContext.state;
+}
+
+// Memory utilities
+
+bool MQTTOTA::checkMemory(size_t requiredBytes) {
+  size_t freeHeap = ESP.getFreeHeap();
+  bool ok = freeHeap >= (requiredBytes + MQTT_OTA_MIN_MEMORY);
+  if (!ok) {
+    Serial.printf("[MQTTOTA] Low memory: %u free, need %zu\n", freeHeap,
+                  requiredBytes + MQTT_OTA_MIN_MEMORY);
+  }
+  return ok;
+}
+
+size_t MQTTOTA::getFreeHeap() { return ESP.getFreeHeap(); }
+
+void MQTTOTA::logMemoryStatus() {
+  Serial.printf("[MQTTOTA] Heap — free=%u  minFree=%u  maxAlloc=%u\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+}
+
+// Diagnostics
+
+void MQTTOTA::printDiagnostics() {
+  Serial.println("=== MQTTOTA Diagnostics ===");
+  Serial.printf("  DeviceID : %s\n", _deviceID.c_str());
+  Serial.printf("  Device   : %s\n", _deviceName.c_str());
+  Serial.printf("  Version  : %s\n", _firmwareVersion.c_str());
+  Serial.printf("  State    : %s\n", _getStateName(_otaContext.state).c_str());
+  Serial.printf("  Progress : %d%%\n", _currentProgress);
+  Serial.printf("  Received : %zu B\n", _otaContext.receivedSize);
+  Serial.printf("  Sig req  : %s\n", _requireSig ? "yes" : "no");
+  Serial.printf("  Key set  : %s\n", _hmacKeyLen > 0 ? "yes" : "no");
+
+  logMemoryStatus();
+
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (running) {
+    Serial.printf("  Running  : %s @ 0x%08X\n", running->label,
+                  running->address);
+  }
+  if (_otaContext.update_partition) {
+    Serial.printf("  OTA Part : %s @ 0x%08X (%u B)\n",
                   _otaContext.update_partition->label,
                   _otaContext.update_partition->address,
                   _otaContext.update_partition->size);
-    
-    return true;
+  }
+
+  Serial.printf("  Stats — chunks=%d errors=%d speed=%.1f KB/s\n",
+                _stats.chunkCount, _stats.errorCount,
+                _stats.averageSpeed / 1024.0f);
+  Serial.println("===========================");
 }
 
-// Helper para nombres de estado - FUNCIÓN MIEMBRO CORREGIDA
-String MQTTOTA::_getStateName(OTAState state) {
-    switch(state) {
-        case OTA_STATE_IDLE: return "INACTIVO";
-        case OTA_STATE_RECEIVING: return "RECIBIENDO";
-        case OTA_STATE_DECODING: return "DECODIFICANDO";
-        case OTA_STATE_VALIDATING: return "VALIDANDO";
-        case OTA_STATE_WRITING: return "ESCRIBIENDO";
-        case OTA_STATE_COMPLETING: return "FINALIZANDO";
-        case OTA_STATE_SUCCESS: return "EXITOSO";
-        case OTA_STATE_ERROR: return "ERROR";
-        case OTA_STATE_ABORTED: return "ABORTADO";
-        default: return "DESCONOCIDO";
-    }
+String MQTTOTA::getBootPartitionInfo() {
+  const esp_partition_t *boot = esp_ota_get_boot_partition();
+  if (!boot)
+    return "unknown";
+  char buf[256];
+  snprintf(buf, sizeof(buf), "label=%s type=%d subtype=%d addr=0x%08X size=%u",
+           boot->label, boot->type, boot->subtype, boot->address, boot->size);
+  return String(buf);
 }
+
+// Miscellaneous helpers
+
+void MQTTOTA::_printSHA256(const uint8_t *image_hash, const char *label) {
+  char hash_print[MQTT_OTA_HASH_LEN * 2 + 1];
+  hash_print[MQTT_OTA_HASH_LEN * 2] = 0;
+  for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
+    sprintf(&hash_print[i * 2], "%02x", image_hash[i]);
+  }
+  Serial.printf("%s: %s\n", label, hash_print);
+}
+
+String MQTTOTA::_generateDeviceID() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%04X%08X", (uint16_t)(mac >> 32), (uint32_t)mac);
+  return String(buf);
+}
+
+size_t MQTTOTA::calculateBase64DecodedSize(const String &encoded) {
+  size_t len = encoded.length();
+  size_t padding = 0;
+  if (len > 0 && encoded.charAt(len - 1) == '=')
+    padding++;
+  if (len > 1 && encoded.charAt(len - 2) == '=')
+    padding++;
+  return (len * 3) / 4 - padding;
+}
+
+bool MQTTOTA::checkFirmwareCompatibility(const String &newVersion) {
+  if (newVersion.isEmpty())
+    return false;
+  int dots = 0;
+  for (size_t i = 0; i < newVersion.length(); i++) {
+    char c = newVersion.charAt(i);
+    if (c == '.')
+      dots++;
+    else if (!isdigit(c) && c != '-' && c != '+')
+      return false;
+  }
+  return (dots >= 1 && dots <= 2);
+}
+
+bool MQTTOTA::_validateChecksum(const String &data, const String &checksum) {
+  if (checksum.isEmpty())
+    return true;
+  // Compute SHA-256 of the data and compare
+  String computed =
+      _calculateSHA256((const uint8_t *)data.c_str(), data.length());
+  bool ok = computed.equalsIgnoreCase(checksum);
+  if (!ok) {
+    Serial.printf(
+        "[MQTTOTA] Checksum mismatch\n  expected: %s\n  computed: %s\n",
+        checksum.c_str(), computed.c_str());
+  }
+  return ok;
+}
+
+void MQTTOTA::_handleChunkError(const OTAChunkData &chunk,
+                                const String &error) {
+  Serial.printf("[MQTTOTA] Chunk %d error: %s\n", chunk.partIndex,
+                error.c_str());
+
+  _otaContext.retryCount++;
+  if (_otaContext.retryCount <= _otaContext.maxRetries) {
+    Serial.printf("[MQTTOTA] Retry %d/%d for chunk %d\n",
+                  _otaContext.retryCount, _otaContext.maxRetries,
+                  chunk.partIndex);
+  } else {
+    _publishError("Max retries exceeded: " + error, chunk.firmwareVersion);
+    _cleanupChunkedOTA();
+  }
+}
+
+String MQTTOTA::_getStateName(OTAState state) {
+  switch (state) {
+  case OTA_STATE_IDLE:
+    return "IDLE";
+  case OTA_STATE_RECEIVING:
+    return "RECEIVING";
+  case OTA_STATE_DECODING:
+    return "DECODING";
+  case OTA_STATE_VALIDATING:
+    return "VALIDATING";
+  case OTA_STATE_WRITING:
+    return "WRITING";
+  case OTA_STATE_COMPLETING:
+    return "COMPLETING";
+  case OTA_STATE_SUCCESS:
+    return "SUCCESS";
+  case OTA_STATE_ERROR:
+    return "ERROR";
+  case OTA_STATE_ABORTED:
+    return "ABORTED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void MQTTOTA::setPartitionName(const String &partitionName) {
+  _otaContext.partitionName = partitionName;
+}
+
+OTAState MQTTOTA::getCurrentState() { return _otaContext.state; }
+
+OTAStatistics MQTTOTA::getStatistics() { return _stats; }
 
 void MQTTOTA::enableRollbackProtection(bool enable) {
-    _otaContext.rollbackEnabled = enable;
+  _otaContext.rollbackEnabled = enable;
 }
 
 void MQTTOTA::enableVersionCheck(bool enable) {
-    _otaContext.versionCheckEnabled = enable;
+  _otaContext.versionCheckEnabled = enable;
 }
-

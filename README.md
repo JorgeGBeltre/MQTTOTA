@@ -1,319 +1,343 @@
-# MQTTOTA - For OTA Updates via MQTT/MQTTS
+# MQTTOTA — OTA Updates via MQTT/MQTTS
 
 **MQTTOTA** is an SDK that revolutionizes firmware management for ESP32-based IoT devices. By leveraging the power of MQTT/MQTTS protocols, it provides a seamless, secure, and scalable solution for Over-The-Air updates in distributed IoT ecosystems. Whether you're managing a handful of devices or thousands across global deployments, MQTTOTA ensures reliable firmware delivery with enterprise-level security and robust error handling.
 
 ## Table of Contents
 
+- [What's New in v1.1.0](#whats-new-in-v110)
 - [Overview](#overview)
-- [Backend Implementation](#Backend-Implementation)
 - [Key Features](#key-features)
-  - [Update Methods](#update-methods)
-  - [Security](#security)
-  - [Monitoring and Control](#monitoring-and-control)
 - [Installation](#installation)
-  - [Method 1: Manual Installation](#method-1-manual-installation)
-  - [Method 2: Using PlatformIO](#method-2-using-platformio)
 - [Dependencies](#dependencies)
-  - [Required Libraries](#required-libraries)
-  - [Memory Configuration](#memory-configuration)
 - [Basic Configuration](#basic-configuration)
-  - [Minimum Initialization](#minimum-initialization)
+- [Security — HMAC-SHA256 (v1.1.0)](#security--hmac-sha256-v110)
 - [Standard MQTT Configuration](#standard-mqtt-configuration)
-  - [Example with PubSubClient](#example-with-pubsubclient)
 - [MQTTS (Secure) Configuration](#mqtts-secure-configuration)
-  - [Example with MQTTS and Certificates](#example-with-mqtts-and-certificates)
 - [Message Formats](#message-formats)
-  - [Complete OTA Message](#complete-ota-message)
-  - [Chunked OTA Message](#chunked-ota-message)
-  - [Response Messages](#response-messages)
 - [Advanced Configuration](#advanced-configuration)
-  - [Parameter Customization](#parameter-customization)
-  - [Advanced Memory Management](#advanced-memory-management)
 - [Diagnostics and Troubleshooting](#diagnostics-and-troubleshooting)
-  - [Enable Detailed Logs](#enable-detailed-logs)
-  - [Common Error Handling](#common-error-handling)
 - [Complete API](#complete-api)
-  - [Public Methods](#public-methods)
-    - [Lifecycle Management](#lifecycle-management)
-    - [Message Processing](#message-processing)
-    - [Chunked OTA Configuration](#chunked-ota-configuration)
-    - [Status Query](#status-query)
-    - [Utilities](#utilities)
-  - [Available Callbacks](#available-callbacks)
-    - [Update Progress](#update-progress)
-    - [Error Handling](#error-handling)
-    - [Successful Completion](#successful-completion)
 - [Performance Considerations](#performance-considerations)
-  - [Memory Optimization](#memory-optimization)
-  - [Handling Unstable Connections](#handling-unstable-connections)
 - [Best Practices](#best-practices)
 - [Complete Workflows](#complete-workflows)
-  - [Successful OTA Flow](#successful-ota-flow)
-  - [OTA Error Flow](#ota-error-flow)
-- [Support and Contributions](#support-and-contributions)
-  - [Reporting Issues](#reporting-issues)
-  - [Development Best Practices](#development-best-practices)
+- [Backend Implementation](#backend-implementation)
+- [Broker Compatibility](#broker-compatibility)
+- [License](#license)
 - [Contact](#contact)
+
+---
+
+## What's New in v1.1.0
+
+This release resolves **8 issues** identified in a technical audit of v1.0.1. All changes are backward-compatible unless noted.
+
+###  Security fixes
+
+| Issue | Description | Solution |
+|---|---|---|
+| **#1** | `_calculateSHA256()` always returned `""` — SHA-256 was declared but never computed | Implemented with `mbedtls_sha256` — real incremental digest |
+| **#2** | `verifyFirmwareSignature()` always returned `true` — HMAC was never verified | Real HMAC-SHA256 via `mbedtls_md_hmac`. New API: `setSecurityKey()` / `requireSignature()` |
+
+###  Memory fixes
+
+| Issue | Description | Solution |
+|---|---|---|
+| **#3** | `DynamicJsonDocument(32768)` allocated 32 KB on the heap on every message | All JSON documents migrated to `StaticJsonDocument` on the stack |
+| **#6** | `getFreeOTASpace()` was commented out with a compilation error note | Implemented correctly using `esp_ota_get_next_update_partition()->size` |
+
+###  Robustness fixes
+
+| Issue | Description | Solution |
+|---|---|---|
+| **#4** | `delay(2000)` / `delay(3000)` before `ESP.restart()` blocked the FreeRTOS scheduler | Replaced with a non-blocking timer polled in `handle()`. **`handle()` must be called every `loop()`** |
+| **#5** | Two parallel state variables: `_otaInProgress` and `_otaContext.inProgress` could go out of sync | Unified into `_otaContext.inProgress`. `isUpdateInProgress()` now reads a single source |
+| **#7** | `_setState()` was only called in a few places — `getCurrentState()` returned stale values | `_setState()` is now called at every transition: `IDLE → RECEIVING → DECODING → VALIDATING → WRITING → COMPLETING → SUCCESS/ERROR` |
+| **#8** | `esp_ota_mark_app_valid_cancel_rollback()` was never called automatically | Called in `begin()` whenever the running partition is an OTA partition |
+
+###  Breaking behavior change (v1.1.0)
+
+> In v1.0.1 the device restarted automatically via a blocking `delay()+ESP.restart()` after a successful OTA.
+>
+> In v1.1.0 the restart is **non-blocking** and is driven by a timer polled in `handle()`. If you do not call `handle()` in your `loop()`, the device will **not** restart automatically after OTA.
+>
+> **Action required:** Ensure `ota.handle()` is called every `loop()` iteration.
+
+```cpp
+void loop() {
+    mqttClient.loop();
+    ota.handle();   // Required: drives restart timer + timeout watchdog
+}
+```
+
+---
 
 ## Overview
 
-**MQTTOTA** is a robust and comprehensive SDK that enables secure Over-The-Air (OTA) firmware updates using MQTT and MQTTS protocols. Specifically designed for ESP32-based IoT devices, it offers multiple update methods with error handling, progress tracking, and recovery capabilities.
+MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both single-message and chunked firmware transfers, integrates directly with the ESP-IDF OTA partition API (`esp_ota_ops.h`), and since v1.1.0 provides real cryptographic verification with SHA-256 and HMAC-SHA256 via mbedtls (bundled with ESP32 Arduino).
 
+---
 
 ## Key Features
 
 ### Update Methods
-- **Full OTA**: Update with a single MQTT message
-- **Chunked OTA**: Fragmented transfer for large firmware files
-- **Native ESP-IDF OTA**: Robust implementation using native ESP32 APIs
-- **Firmware Validation**: Integrity and compatibility verification
+- **Full OTA** — Single MQTT message with complete firmware
+- **Chunked OTA** — Fragmented transfer for large firmware files with strict sequence validation
+- **Native ESP-IDF OTA** — Uses `esp_ota_begin/write/end` directly; no dependency on `Update.h` layer
 
-### Security
-- **MQTTS Supported**: Encrypted communication with TLS certificates
-- **Base64 Validation**: Firmware data verification
-- **SHA-256 Checksum**: Image integrity verification
-- **Configurable Timeout**: Protection against hung updates
+### Security (v1.1.0)
+- **MQTTS** — Encrypted transport via TLS (delegated to the external MQTT client)
+- **Real SHA-256** — Integrity digest computed with `mbedtls_sha256` on every chunk
+- **Real HMAC-SHA256** — Firmware origin authentication via `setSecurityKey()` + `requireSignature()`
+- **Image header verification** — Validates ESP32 magic number and segment count before writing
+- **Configurable timeout** — 7-minute watchdog cancels hung updates
 
 ### Monitoring and Control
-- **Event Callbacks**: Progress, success, and error
-- **Progress Tracking**: Real-time reporting
-- **System Status**: Progress and version query
-- **Detailed Logs**: Comprehensive diagnostic information
+- **9-state machine** — `IDLE → RECEIVING → DECODING → VALIDATING → WRITING → COMPLETING → SUCCESS/ERROR/ABORTED`
+- **Event callbacks** — `onProgress`, `onError`, `onSuccess`, `onStateChange`
+- **OTA statistics** — bytes, chunk count, error count, average speed (KB/s)
+- **Non-blocking restart** (v1.1.0) — restart scheduled after OTA without blocking `loop()`
+
+---
 
 ## Installation
 
-### Method 1: Manual Installation
-1. Download `MQTTOTA.h` and `MQTTOTA.cpp` files
-2. Create `MQTTOTA` folder in `Arduino/libraries/`
-3. Copy files to the folder
-4. Restart Arduino IDE
+### Method 1: Manual
+1. Download `MQTTOTA.h` and `MQTTOTA.cpp`
+2. Create `MQTTOTA/` folder in `Arduino/libraries/`
+3. Copy files there and restart Arduino IDE
 
-### Method 2: Using PlatformIO
+### Method 2: PlatformIO
 ```ini
 lib_deps =
-    https://github.com/JorgeBeltre/MQTTOTA.git
+    https://github.com/JorgeGBeltre/MQTTOTA.git
 ```
+
+---
 
 ## Dependencies
 
-### Required Libraries
 ```cpp
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <ArduinoJson.h>        // v6.19+
+#include <ArduinoJson.h>        // v6.19+ (ArduinoJson v7 not yet tested)
 #include <Update.h>
+#include <mbedtls/sha256.h>     // v1.1.0 — bundled with ESP32 Arduino, no extra install
+#include <mbedtls/md.h>         // v1.1.0 — bundled with ESP32 Arduino, no extra install
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
 #include "esp_partition.h"
 ```
 
-### Memory Configuration
+> No additional library installs are needed for mbedtls — it ships with the ESP32 Arduino core.
+
+### Configuration macros (override before `#include "MQTTOTA.h"`)
+
 ```cpp
-// Adjust according to your device
-#define MQTT_OTA_JSON_SIZE 32768    // For large messages
-#define MQTT_OTA_BUFFSIZE 1024      // Chunk size
+#define MQTT_OTA_JSON_SIZE       8192   // Stack size for JSON parser (v1.1.0: was 32768 heap)
+#define MQTT_OTA_BUFFSIZE        1024   // Write buffer per chunk
+#define MQTT_OTA_TIMEOUT_MS    420000  // Total OTA timeout (7 min)
+#define MQTT_OTA_MAX_CHUNK_SIZE 65536  // Max decoded bytes per MQTT chunk
+#define MQTT_OTA_MIN_MEMORY     40000  // Min free heap before starting OTA
+#define MQTT_OTA_MAX_RETRIES        3  // Chunk retry limit
+#define MQTT_OTA_HMAC_KEY_SIZE     64  // Max HMAC key length (bytes)
+#define MQTT_OTA_RESTART_DELAY_MS 3000 // Non-blocking restart delay (ms)
 ```
+
+> **Stack note:** `StaticJsonDocument<MQTT_OTA_JSON_SIZE>` lives on the stack of `loop()`. The default 8 KB fits comfortably in the ESP32's 8 KB `loop()` stack. If you use FreeRTOS tasks with custom stacks, ensure the task stack is ≥ 10 KB.
+
+---
 
 ## Basic Configuration
 
-### Minimum Initialization
 ```cpp
-#include <MQTTOTA.h>
+#include "MQTTOTA.h"
 
 MQTTOTA ota;
 
 void setup() {
     Serial.begin(115200);
-    
-    // Basic configuration
     ota.begin("MyDevice", "1.0.0");
+    // begin() also calls esp_ota_mark_app_valid_cancel_rollback()
+    // automatically when running from an OTA partition (v1.1.0)
 }
 
 void loop() {
-    ota.handle();
+    ota.handle();   // Required every loop — drives restart timer and timeout
 }
 ```
+
+---
+
+## Security — HMAC-SHA256 (v1.1.0)
+
+v1.1.0 adds real firmware authentication. Without a configured key the behavior is identical to v1.0.1 (backward compatible).
+
+### Enabling HMAC verification
+
+```cpp
+void setup() {
+    ota.begin("MyDevice", "1.0.0");
+
+    // Set shared secret (must match the key used by your backend to sign firmware)
+    ota.setSecurityKey("my-super-secret-key-at-least-32-chars");
+
+    // Optional: reject any OTA message that does not carry a valid HMAC
+    ota.requireSignature(true);
+}
+```
+
+### Backend: signing the firmware
+
+Your backend must compute `HMAC-SHA256(decoded_firmware_bytes, key)` and send it as a hex string in the `checksum` field (or in a User Property if using MQTTOTAv5).
+
+```python
+# Python example
+import hmac, hashlib
+
+key   = b"my-super-secret-key-at-least-32-chars"
+data  = open("firmware.bin", "rb").read()
+sig   = hmac.new(key, data, hashlib.sha256).hexdigest()
+print(sig)   # 64-char hex string → include in OTA message
+```
+
+### Manual verification in your code
+
+```cpp
+// Verify a payload before passing it to processMessage()
+const uint8_t* rawBytes = /* decoded firmware */;
+size_t rawLen = /* size */;
+String expectedHmac = "64-char-hex-from-server";
+
+if (ota.verifyFirmwareSignature(rawBytes, rawLen, expectedHmac)) {
+    Serial.println("Firmware authenticated");
+} else {
+    Serial.println("HMAC mismatch — firmware rejected");
+}
+```
+
+---
 
 ## Standard MQTT Configuration
 
 ### Example with PubSubClient
+
 ```cpp
-#include <MQTTOTA.h>
+#include "MQTTOTA.h"
 #include <PubSubClient.h>
 #include <WiFi.h>
 
-WiFiClient wifiClient;
+WiFiClient   wifiClient;
 PubSubClient mqttClient(wifiClient);
-MQTTOTA ota;
+MQTTOTA      ota;
 
-// WiFi configuration
-const char* ssid = "your_SSID";
-const char* password = "your_PASSWORD";
-
-// MQTT configuration
-const char* mqttServer = "broker.hivemq.com";
-const int mqttPort = 1883;
-const char* mqttTopic = "devices/my_device/ota";
-
-void setupWiFi() {
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(1000);
-        Serial.println("Connecting to WiFi...");
-    }
-    Serial.println("WiFi connected");
-}
-
-void setupMQTT() {
-    mqttClient.setServer(mqttServer, mqttPort);
-    mqttClient.setCallback(mqttCallback);
-    
-    while (!mqttClient.connected()) {
-        if (mqttClient.connect("my_device")) {
-            mqttClient.subscribe(mqttTopic);
-            Serial.println("MQTT connected");
-        } else {
-            delay(5000);
-        }
-    }
-}
+const char* ssid      = "your_SSID";
+const char* password  = "your_PASSWORD";
+const char* mqttServer= "broker.hivemq.com";
+const int   mqttPort  = 1883;
+const char* otaTopic  = "devices/my_device/ota";
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String message;
-    for (int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    
-    // Process OTA message
+    for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
     ota.processMessage(String(topic), message);
 }
 
 void setup() {
     Serial.begin(115200);
-    
-    setupWiFi();
-    setupMQTT();
-    
-    // Configure MQTTOTA
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) { delay(500); }
+
+    mqttClient.setServer(mqttServer, mqttPort);
+    mqttClient.setCallback(mqttCallback);
+    while (!mqttClient.connect("my_device")) { delay(5000); }
+    mqttClient.subscribe(otaTopic);
+
     ota.begin("MyDevice", "1.0.0");
     ota.setMQTTConfig(
-        // Function to publish
-        [](const char* topic, const String& message) {
-            mqttClient.publish(topic, message.c_str());
-        },
-        // Function to check connection
-        []() {
-            return mqttClient.connected();
-        },
-        // OTA topic (optional, default "ota")
-        mqttTopic
+        [](const char* topic, const String& msg) { mqttClient.publish(topic, msg.c_str()); },
+        []() { return mqttClient.connected(); },
+        otaTopic
     );
-    
-    // Configure callbacks
-    ota.onProgress([](int progress, const String& version) {
-        Serial.printf("OTA Progress: %d%% (v%s)\n", progress, version.c_str());
+
+    ota.onProgress([](int pct, const String& ver) {
+        Serial.printf("OTA %d%% — v%s\n", pct, ver.c_str());
     });
-    
-    ota.onError([](const String& error, const String& version) {
-        Serial.printf("OTA Error: %s (v%s)\n", error.c_str(), version.c_str());
+    ota.onError([](const String& err, const String& ver) {
+        Serial.printf("OTA error: %s (v%s)\n", err.c_str(), ver.c_str());
     });
-    
-    ota.onSuccess([](const String& version) {
-        Serial.printf("OTA Completed: v%s\n", version.c_str());
+    ota.onSuccess([](const String& ver) {
+        Serial.printf("OTA complete: v%s\n", ver.c_str());
     });
 }
 
 void loop() {
-    if (!mqttClient.connected()) {
-        setupMQTT();
-    }
+    if (!mqttClient.connected()) { /* reconnect */ }
+    mqttClient.loop();
+    ota.handle();   // Required: non-blocking restart + timeout watchdog
+}
+```
+
+---
+
+## MQTTS (Secure) Configuration
+
+```cpp
+#include "MQTTOTA.h"
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+WiFiClientSecure wifiClient;
+PubSubClient     mqttClient(wifiClient);
+MQTTOTA          ota;
+
+const char* rootCA = \
+"-----BEGIN CERTIFICATE-----\n" \
+"... your CA certificate ...\n" \
+"-----END CERTIFICATE-----\n";
+
+void setup() {
+    Serial.begin(115200);
+    // ... WiFi setup ...
+
+    wifiClient.setCACert(rootCA);
+    mqttClient.setServer("your-secure-broker.com", 8883);
+    mqttClient.setCallback([](char* topic, byte* payload, unsigned int len) {
+        String msg;
+        for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+        ota.processMessage(String(topic), msg);
+    });
+    // ... connect and subscribe ...
+
+    ota.begin("MySecureDevice", "1.0.0");
+    // Recommended in production:
+    ota.setSecurityKey("production-hmac-secret-key-here");
+    ota.requireSignature(true);
+
+    ota.setMQTTConfig(
+        [](const char* t, const String& m) { mqttClient.publish(t, m.c_str()); },
+        []() { return mqttClient.connected(); },
+        "devices/secure/ota"
+    );
+}
+
+void loop() {
     mqttClient.loop();
     ota.handle();
 }
 ```
 
-## MQTTS (Secure) Configuration
-
-### Example with MQTTS and Certificates
-```cpp
-#include <MQTTOTA.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
-
-WiFiClientSecure wifiClient;
-PubSubClient mqttClient(wifiClient);
-MQTTOTA ota;
-
-// MQTTS configuration
-const char* mqttServer = "your-secure-server.com";
-const int mqttPort = 8883;
-const char* mqttUser = "username";
-const char* mqttPassword = "password";
-
-// CA Certificate (optional, for strict verification)
-const char* rootCA = \
-"-----BEGIN CERTIFICATE-----\n" \
-"MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF\n" \
-// ... your complete CA certificate
-"-----END CERTIFICATE-----\n";
-
-void setupMQTTS() {
-    // Configure secure client
-    wifiClient.setCACert(rootCA);
-    // wifiClient.setCertificate(client_cert);  // For client certificate
-    // wifiClient.setPrivateKey(client_key);    // For private key
-    
-    mqttClient.setServer(mqttServer, mqttPort);
-    mqttClient.setCallback(mqttCallback);
-    
-    // Connect with authentication
-    while (!mqttClient.connected()) {
-        if (mqttClient.connect("my_secure_device", mqttUser, mqttPassword)) {
-            mqttClient.subscribe("devices/secure/ota");
-            Serial.println("MQTTS securely connected");
-        } else {
-            Serial.print("MQTTS Error: ");
-            Serial.println(mqttClient.state());
-            delay(5000);
-        }
-    }
-}
-
-void setup() {
-    Serial.begin(115200);
-    setupWiFi();  // Same WiFi function from previous example
-    
-    setupMQTTS();
-    
-    // Configure MQTTOTA same as normal MQTT
-    ota.begin("MySecureDevice", "1.0.0");
-    ota.setMQTTConfig(
-        [](const char* topic, const String& message) {
-            mqttClient.publish(topic, message.c_str());
-        },
-        []() {
-            return mqttClient.connected();
-        },
-        "devices/secure/ota"
-    );
-    
-    // Callbacks work the same
-    ota.onProgress(progressCallback);
-    ota.onError(errorCallback);
-    ota.onSuccess(successCallback);
-}
-```
+---
 
 ## Message Formats
 
-### Complete OTA Message
+### Complete OTA Message (single-message mode)
 ```json
 {
   "EventType": "UpdateFirmwareDevice",
   "Details": {
     "FirmwareVersion": "1.1.0",
-    "Base64": "base64_encoded_firmware_data_here...",
+    "Base64": "<complete_firmware_base64>",
     "IsError": false,
     "ErrorMessage": null
   }
@@ -326,7 +350,7 @@ void setup() {
   "EventType": "UpdateFirmwareDevice",
   "Details": {
     "FirmwareVersion": "1.1.0",
-    "Base64Part": "chunk_base64_data_here...",
+    "Base64Part": "<chunk_base64>",
     "PartIndex": 1,
     "TotalParts": 10,
     "IsError": false,
@@ -335,349 +359,344 @@ void setup() {
 }
 ```
 
-### Response Messages
+### Response Messages (published by the device)
+
 ```json
-// Progress
-{
-  "device": "ABC123",
-  "version": "1.1.0",
-  "progress": 45,
-  "timestamp": 1234567890
-}
+// ota/progress  (throttled to multiples of 10%)
+{ "device": "ABC123", "version": "1.1.0", "progress": 50, "timestamp": 123456 }
 
-// Error
-{
-  "device": "ABC123",
-  "version": "1.1.0",
-  "error": "Update timeout",
-  "timestamp": 1234567890
-}
+// ota/error
+{ "device": "ABC123", "version": "1.1.0", "error": "SHA-256 mismatch", "timestamp": 123456 }
 
-// Success
-{
-  "device": "ABC123",
-  "version": "1.1.0",
-  "success": true,
-  "timestamp": 1234567890
-}
+// ota/success
+{ "device": "ABC123", "version": "1.1.0", "success": true, "timestamp": 123456 }
+
+// ota/state  (every state transition)
+{ "device": "ABC123", "state": 5, "state_name": "WRITING", "timestamp": 123456 }
 ```
+
+---
 
 ## Advanced Configuration
 
-### Parameter Customization
+### Full configuration example
+
 ```cpp
 void setup() {
     ota.begin("MyDevice", "2.0.0");
-    
-    // Enable/disable chunked OTA
-    ota.enableChunkedOTA(true);  // Default true
-    
-    // Configure chunk size
-    ota.setChunkSize(2048);  // 2KB per chunk
-    
-    // Configure advanced callbacks
-    ota.onProgress([](int progress, const String& version) {
-        // Publish progress to dashboard
-        publishToDashboard("ota_progress", progress);
-        
-        // Control status LED
-        if (progress < 100) {
-            digitalWrite(LED_PIN, progress % 2);  // Blinking
-        } else {
-            digitalWrite(LED_PIN, HIGH);  // Solid on
-        }
-    });
-    
-    ota.onError([](const String& error, const String& version) {
-        // Log error in logging system
-        logError("OTA_FAILED", error);
-        
-        // Send notification
-        sendNotification("OTA Error: " + error);
-        
-        // Retry after error
-        if (error.indexOf("timeout") != -1) {
-            delay(30000);
-            attemptReconnect();
-        }
+
+    // Security (v1.1.0)
+    ota.setSecurityKey("your-shared-secret");
+    ota.requireSignature(true);
+
+    // Transfer mode
+    ota.enableChunkedOTA(true);   // Default: true
+    ota.setChunkSize(2048);
+
+    // Resilience
+    ota.setMaxRetries(5);
+    ota.setAutoReset(true);       // Schedule non-blocking restart after OTA
+    ota.enableVersionCheck(true); // Reject if version matches current
+    ota.enableRollbackProtection(true);
+
+    // MQTT
+    ota.setMQTTConfig(publishFn, connectedFn, "devices/my/ota");
+
+    // Callbacks
+    ota.onProgress([](int pct, const String& ver) { /* ... */ });
+    ota.onError([](const String& err, const String& ver) { /* ... */ });
+    ota.onSuccess([](const String& ver) { /* ... */ });
+    ota.onStateChange([](uint8_t state) {
+        Serial.printf("OTA state changed: %d\n", state);
     });
 }
 ```
 
-### Advanced Memory Management
-```cpp
-void checkSystemResources() {
-    Serial.printf("Free memory: %d\n", ESP.getFreeHeap());
-    Serial.printf("OTA in progress: %s\n", ota.isUpdateInProgress() ? "Yes" : "No");
-    Serial.printf("Current version: %s\n", ota.getCurrentVersion());
-    Serial.printf("Current progress: %d%%\n", ota.getProgress());
-}
+### Memory monitoring
 
-// In your main loop
+```cpp
 void loop() {
-    static unsigned long lastCheck = 0;
-    
     ota.handle();
-    
+
+    static unsigned long lastCheck = 0;
     if (millis() - lastCheck > 30000) {
-        checkSystemResources();
+        MQTTOTA::logMemoryStatus();         // free/min/maxAlloc heap
+        Serial.printf("OTA space: %zu B\n", ota.getFreeOTASpace()); // v1.1.0
         lastCheck = millis();
     }
-    
-    // Only process other tasks if no OTA in progress
+
     if (!ota.isUpdateInProgress()) {
         handleSensors();
-        handleUserInput();
         publishTelemetry();
     }
 }
 ```
 
+---
+
 ## Diagnostics and Troubleshooting
 
-### Enable Detailed Logs
-```cpp
-void setup() {
-    Serial.begin(115200);
-    
-    // Verify OTA partitions
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    const esp_partition_t* update = esp_ota_get_next_update_partition(NULL);
-    
-    Serial.printf("Current partition: %s\n", running->label);
-    Serial.printf("Update partition: %s\n", update->label);
-    Serial.printf("Available size: %d bytes\n", update->size);
-}
+### Built-in diagnostic dump
 
-// OTA diagnostic function
-void printOTADiagnostics() {
-    Serial.println("=== OTA DIAGNOSTICS ===");
-    Serial.printf("Free memory: %d bytes\n", ESP.getFreeHeap());
-    Serial.printf("OTA in progress: %s\n", ota.isUpdateInProgress() ? "YES" : "NO");
-    Serial.printf("Firmware version: %s\n", ota.getCurrentVersion());
-    Serial.printf("Device ID: %s\n", ota.getDeviceID());
-    
-    if (ota.isUpdateInProgress()) {
-        Serial.printf("Progress: %d%%\n", ota.getProgress());
+```cpp
+ota.printDiagnostics();
+// Output:
+// === MQTTOTA Diagnostics ===
+//   DeviceID : ESP32_OTA_TEST
+//   Device   : ESP32_OTA_TEST
+//   Version  : 1.0.0
+//   State    : IDLE
+//   Progress : 0%
+//   Received : 0 B
+//   Sig req  : yes
+//   Key set  : yes
+//   Heap — free=180000  minFree=120000  maxAlloc=90000
+//   Running  : ota_0 @ 0x00010000
+//   Stats — chunks=0 errors=0 speed=0.0 KB/s
+// ===========================
+```
+
+### Common error handling
+
+```cpp
+ota.onError([](const String& error, const String& version) {
+    if (error.indexOf("memory") != -1) {
+        Serial.println("Low memory — free resources and retry");
+        MQTTOTA::logMemoryStatus();
+    } else if (error.indexOf("timeout") != -1) {
+        Serial.println("OTA timed out — check MQTT connection");
+    } else if (error.indexOf("SHA-256") != -1) {
+        Serial.println("Integrity check failed — firmware rejected");
+    } else if (error.indexOf("HMAC") != -1) {
+        Serial.println("Authentication failed — check HMAC key");
+    } else if (error.indexOf("sequence") != -1) {
+        Serial.println("Chunk out of order — restart the transfer");
     }
-}
+});
 ```
 
-### Common Error Handling
-```cpp
-void handleOTAErrors() {
-    ota.onError([](const String& error, const String& version) {
-        Serial.printf("OTA error detected: %s\n", error.c_str());
-        
-        if (error.indexOf("memory") != -1) {
-            Serial.println("Freeing memory...");
-            freeUnusedResources();
-        } else if (error.indexOf("timeout") != -1) {
-            Serial.println("Reconnecting...");
-            reconnectNetwork();
-        } else if (error.indexOf("partition") != -1) {
-            Serial.println("Verify OTA partitions");
-            checkPartitions();
-        }
-        
-        // Clean OTA state
-        ota.cleanup();
-    });
-}
+### OTA state machine (v1.1.0)
+
 ```
+IDLE
+ └─► RECEIVING      (begin() partition found, esp_ota_begin OK)
+      └─► DECODING  (base64 decoded successfully)
+           └─► VALIDATING  (image header + SHA-256/HMAC check)
+                └─► WRITING     (esp_ota_write per chunk)
+                     └─► COMPLETING  (all chunks received)
+                          ├─► SUCCESS  → pending non-blocking restart
+                          └─► ERROR    → cleanup, back to IDLE
+```
+
+---
 
 ## Complete API
 
-### Public Methods
+### Lifecycle
 
-#### Lifecycle Management
 ```cpp
-// Initialization
 void begin(const String& deviceName, const String& firmwareVersion);
+// Also calls esp_ota_mark_app_valid_cancel_rollback() on OTA partitions (v1.1.0)
 
-// MQTT Configuration
-void setMQTTConfig(
-    std::function<void(const char* topic, const String& message)> publishFunc,
-    std::function<bool()> isConnectedFunc,
-    const String& otaTopic = "ota"
-);
-
-// Main handling
 void handle();
+// REQUIRED every loop() — drives restart timer and timeout watchdog (v1.1.0)
+
+void setMQTTConfig(publishFn, isConnectedFn, otaTopic = "ota");
+void setPartitionName(const String& partitionName = "");
 ```
 
-#### Message Processing
-```cpp
-// Process MQTT messages
-void processMessage(const String& topic, const String& message);
+### Security (v1.1.0)
 
-// Perform manual update
-bool performUpdate(const String& base64Data, const String& firmwareVersion);
+```cpp
+void setSecurityKey(const char* key);      // Set HMAC-SHA256 key (max 64 bytes)
+void requireSignature(bool required = true); // Reject unsigned payloads if true
+
+// Verify HMAC on raw decoded bytes (recommended)
+bool verifyFirmwareSignature(const uint8_t* data, size_t len, const String& expectedHex);
+
+// Legacy overload — backward compat, does not compute HMAC without raw data
+bool verifyFirmwareSignature(const String& signature);
 ```
 
-#### Chunked OTA Configuration
+### OTA Configuration
+
 ```cpp
-// Enable/disable chunks
 void enableChunkedOTA(bool enable = true);
-
-// Configure chunk size
 void setChunkSize(size_t chunkSize);
+void setAutoReset(bool autoReset = true);
+void setMaxRetries(int maxRetries);
+void enableVersionCheck(bool enable = true);
+void enableRollbackProtection(bool enable = true);
 ```
 
-#### Status Query
+### Processing
+
 ```cpp
-// Current status
-bool isUpdateInProgress();
-String getCurrentVersion();
-String getDeviceID();
-int getProgress();
+void processMessage(const String& topic, const String& message);
+bool performUpdate(const String& base64Data, const String& firmwareVersion);
+void abortUpdate();
 ```
 
-#### Utilities
+### Status & Query
+
 ```cpp
-// State cleanup
-void cleanup();
-
-// Base64 encoding (static)
-static String base64Decode(const String& encoded);
-static String base64Encode(const String& input);
+bool      isUpdateInProgress() const;  // v1.1.0: single source of truth
+bool      isValidating()       const;
+bool      isWriting()          const;
+OTAState  getCurrentState();           // Full 9-state enum
+int       getProgress();
+String    getCurrentVersion();
+String    getDeviceID();
+size_t    getFreeOTASpace();           // v1.1.0: was commented out
+OTAStatistics getStatistics();         // bytes, chunks, errors, avgSpeed
+String    getBootPartitionInfo();
+void      printDiagnostics();
 ```
 
-### Available Callbacks
+### Memory Utilities
 
-#### Update Progress
 ```cpp
-void onProgress(MQTTOTACallback callback);
-// Example: ota.onProgress([](int progress, const String& version) { ... });
+static bool   checkMemory(size_t requiredBytes);
+static size_t getFreeHeap();
+static void   logMemoryStatus();
 ```
 
-#### Error Handling
+### Callbacks
+
 ```cpp
-void onError(MQTTOTAErrorCallback callback);
-// Example: ota.onError([](const String& error, const String& version) { ... });
+void onProgress(MQTTOTACallback callback);           // (int pct, const String& ver)
+void onError(MQTTOTAErrorCallback callback);         // (const String& err, const String& ver)
+void onSuccess(MQTTOTASuccessCallback callback);     // (const String& ver)
+void onStateChange(MQTTOTAStateCallback callback);   // (uint8_t state)
 ```
 
-#### Successful Completion
+### OTA State Enum
+
 ```cpp
-void onSuccess(MQTTOTASuccessCallback callback);
-// Example: ota.onSuccess([](const String& version) { ... });
+enum OTAState {
+    OTA_STATE_IDLE       = 0,
+    OTA_STATE_RECEIVING  = 1,
+    OTA_STATE_DECODING   = 2,
+    OTA_STATE_VALIDATING = 3,
+    OTA_STATE_WRITING    = 4,
+    OTA_STATE_COMPLETING = 5,
+    OTA_STATE_SUCCESS    = 6,
+    OTA_STATE_ERROR      = 7,
+    OTA_STATE_ABORTED    = 8
+};
 ```
+
+---
 
 ## Performance Considerations
 
-### Memory Optimization
-```cpp
-// For memory-limited devices
-#define MQTT_OTA_JSON_SIZE 16384
-#define MQTT_OTA_BUFFSIZE 512
+### Chunked vs. full mode
 
-void setup() {
-    // Reduce chunk size
-    ota.setChunkSize(512);
-    
-    // Monitor memory
-    Serial.printf("Initial memory: %d\n", ESP.getFreeHeap());
-}
+| Mode | Heap impact | Recommended for |
+|---|---|---|
+| Full (single message) | ~8 KB stack (StaticJson) + decoded size in RAM | Firmware < 100 KB |
+| Chunked | ~4 KB stack (StaticJson) + 1 chunk in RAM | Any firmware size |
+
+### Throughput tips
+
+```cpp
+// Larger chunks = better throughput (up to MQTT_OTA_MAX_CHUNK_SIZE = 64 KB)
+ota.setChunkSize(16384);  // 16 KB chunks
+
+// Reduce retries to fail faster on unstable links
+ota.setMaxRetries(2);
+
+// Track average speed
+OTAStatistics s = ota.getStatistics();
+Serial.printf("Speed: %.1f KB/s\n", s.avgSpeedBps / 1024.0f);
 ```
 
-### Handling Unstable Connections
+### Handling unstable connections
+
 ```cpp
-void robustOTAHandling() {
-    ota.onError([](const String& error, const String& version) {
-        if (error.indexOf("timeout") != -1 || error.indexOf("connection") != -1) {
-            Serial.println("Retrying in 30 seconds...");
-            delay(30000);
-            ESP.restart();  // Or reconnect smoothly
-        }
-    });
-}
+ota.onError([](const String& error, const String& version) {
+    if (error.indexOf("timeout") != -1 || error.indexOf("sequence") != -1) {
+        Serial.println("Transfer interrupted — will retry on next OTA message");
+        // No manual restart needed; state is already IDLE after cleanup
+    }
+});
 ```
+
+---
 
 ## Best Practices
 
-### 1. **Always Use MQTTS in Production**
+### 1. Always use MQTTS + HMAC in production
+
 ```cpp
-// In production, always use encryption
+// Transport encryption
 wifiClient.setCACert(rootCA);
-// Never send firmware in clear text
+
+// Firmware authentication (v1.1.0)
+ota.setSecurityKey("production-secret-min-32-chars");
+ota.requireSignature(true);
 ```
 
-### 2. **Validate Before Updating**
+### 2. Check memory before triggering OTA
+
 ```cpp
-// Verify resources before OTA
 bool canStartOTA() {
-    return (ESP.getFreeHeap() > 50000) && 
+    return (ESP.getFreeHeap() > 50000) &&
            (WiFi.status() == WL_CONNECTED) &&
            (!ota.isUpdateInProgress());
 }
 ```
 
-### 3. **Graceful Failure Handling**
-```cpp
-ota.onError([](const String& error, const String& version) {
-    // Don't restart immediately, allow recovery
-    logError("OTA_FAILED", error);
-    
-    // Wait and retry
-    if (autoRetryEnabled) {
-        delay(60000);
-        attemptRecovery();
-    }
-});
-```
+### 3. Always call handle() in loop()
 
-### 4. **Backup and Rollback**
 ```cpp
-// Verify previous partition after OTA
-void checkBootPartition() {
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    Serial.printf("Booted from: %s\n", running->label);
+void loop() {
+    mqttClient.loop();
+    ota.handle();   // Never skip this — non-blocking restart depends on it
 }
 ```
+
+### 4. Use printDiagnostics() before shipping
+
+```cpp
+// In setup(), after begin(), log the full state
+ota.printDiagnostics();
+// Confirms partition, rollback status, HMAC key, and heap
+```
+
+---
 
 ## Complete Workflows
 
-### Successful OTA Flow
-1. Device connected to WiFi and MQTT
-2. Receives valid OTA message
-3. Validates resources and firmware
-4. Starts update with progress
-5. Verifies image and writes partition
-6. Configures new boot partition
-7. Restarts and loads new firmware
-8. Confirms success to server
+### Successful chunked OTA (v1.1.0 flow)
 
-### OTA Error Flow
-1. Device receives OTA message
-2. Detects insufficient resources
-3. Publishes specific error
-4. Cleans internal state
-5. Allows later retry
-6. Continues normal operation
-
-## Support and Contributions
-
-### Reporting Issues
-Always include:
-- SDK version
-- Platform (Arduino IDE/PlatformIO)
-- Complete error logs
-- MQTT/MQTTS configuration
-- Message causing the issue
-
-### Development Best Practices
-```cpp
-// Example of well-structured code
-void handleOTAMessage(String topic, String message) {
-    if (!ota.isUpdateInProgress() && 
-        hasSufficientMemory() && 
-        isStableConnection()) {
-        ota.processMessage(topic, message);
-    } else {
-        deferOTAMessage(topic, message);
-    }
-}
 ```
+Backend                          ESP32 Device
+  │                                  │
+  │─── chunk 1/10 (partIndex=1) ────►│  esp_ota_begin()
+  │◄── ota/progress: 10% ────────────│  RECEIVING → DECODING → VALIDATING → WRITING
+  │                                  │
+  │─── chunk 2/10 ──────────────────►│  esp_ota_write()
+  │◄── ota/progress: 20% ────────────│  WRITING
+  │  ... (chunks 3–9) ...            │
+  │─── chunk 10/10 ─────────────────►│  esp_ota_end()
+  │◄── ota/progress: 95% ────────────│  COMPLETING → VALIDATING (SHA-256) → SUCCESS
+  │◄── ota/success ──────────────────│  schedule restart (3 s timer)
+  │                                  │  ... handle() fires restart ...
+  │                                  │  ESP.restart()
+```
+
+### OTA error flow
+
+```
+Backend                          ESP32 Device
+  │                                  │
+  │─── chunk 3/10 ──────────────────►│  Out-of-sequence (expected 4)
+  │◄── ota/error: "Chunk out of      │  esp_ota_abort()
+  │      sequence" ──────────────────│  State → IDLE, ready for retry
+```
+
+---
 
 ## Backend Implementation
 
@@ -712,11 +731,36 @@ To use MQTTOTA in your project, you'll need an MQTT server to manage OTA updates
 
 The backend provides a scalable architecture for managing multiple devices simultaneously, with support for mass updates and firmware version management.
 
+---
+
+## Broker Compatibility
+
+Tested with:
+- [Mosquitto](https://mosquitto.org/) 2.0+
+- [EMQX](https://www.emqx.com/) 5.0+
+- [HiveMQ Cloud](https://www.hivemq.com/)
+- [AWS IoT Core](https://aws.amazon.com/iot-core/)
+- ESP-IDF MQTT client (used in `BasicOTA` example)
+
+---
+
+## License
+
+Licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+---
+
 ## Contact
 
-Author: **Jorge Gaspar Beltre Rivera**  
-Project: MQTTOTA - For OTA Updates via MQTT/MQTTS
+**Author:** Jorge Gaspar Beltre Rivera  
+**Project:** MQTTOTA - For OTA Updates via MQTT/MQTTS
 
-GitHub: [github.com/JorgeBeltre](https://github.com/JorgeGBeltre)
+- [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/JorgeGBeltre)
+- [![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/jorge-gaspar-beltre-rivera/)
+- [![Email](https://img.shields.io/badge/Email-EA4335?style=for-the-badge&logo=gmail&logoColor=white)](mailto:Jorgegaspar3021@gmail.com)
 
+---
 
+## Support
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.paypal.com/donate/?hosted_button_id=2VLA8BWT967LU)
