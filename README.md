@@ -2,7 +2,7 @@
 
 [![Arduino Library](https://img.shields.io/badge/Arduino-Library-teal)](https://www.arduinolibraries.info/libraries/mqttota)
 [![Platform](https://img.shields.io/badge/platform-ESP32-blue)](https://www.espressif.com/en/products/socs/esp32)
-[![MQTT 3.1.1](https://img.shields.io/badge/MQTT-5.0-orange)](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)
+[![MQTT 3.1.1](https://img.shields.io/badge/MQTT-3.1.1-orange)](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
