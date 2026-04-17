@@ -1,5 +1,11 @@
 # MQTTOTA — OTA Updates via MQTT/MQTTS
 
+[![Arduino Library](https://img.shields.io/badge/Arduino-Library-teal)](https://www.arduinolibraries.info/libraries/mqttota)
+[![Platform](https://img.shields.io/badge/platform-ESP32-blue)](https://www.espressif.com/en/products/socs/esp32)
+[![MQTT 3.1.1](https://img.shields.io/badge/MQTT-5.0-orange)](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+---
 **MQTTOTA** is an SDK that revolutionizes firmware management for ESP32-based IoT devices. By leveraging the power of MQTT/MQTTS protocols, it provides a seamless, secure, and scalable solution for Over-The-Air updates in distributed IoT ecosystems. Whether you're managing a handful of devices or thousands across global deployments, MQTTOTA ensures reliable firmware delivery with enterprise-level security and robust error handling.
 
 ## Table of Contents
