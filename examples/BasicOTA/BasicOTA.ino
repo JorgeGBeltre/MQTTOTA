@@ -534,11 +534,11 @@ void setup() {
   // Initialize MQTTOTA v1.1.0 — topic configured dynamically
   mqttOTA.begin("BasicOTA", FIRMWARE_VERSION);
 
-  // --- v1.1.0 Security (optional but recommended for production) ---
+  // --- v1.2.0 Security (optional but recommended for production) ---
   // Set HMAC-SHA256 key to authenticate incoming firmware payloads.
   // The sender must sign the decoded firmware bytes with this same key.
   // mqttOTA.setSecurityKey("your-secret-key-min-32-chars-long");
-  // mqttOTA.requireSignature(true);  // reject unsigned payloads
+  // mqttOTA.setSecurityMode(SECURITY_HMAC_SHA256);  // reject unsigned payloads
 
   // Configure MQTT transport for MQTTOTA
   mqttOTA.setMQTTConfig(

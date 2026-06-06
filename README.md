@@ -10,13 +10,13 @@
 
 ## Table of Contents
 
-- [What's New in v1.1.0](#whats-new-in-v110)
+- [What's New in v1.2.0](#whats-new-in-v110)
 - [Overview](#overview)
 - [Key Features](#key-features)
 - [Installation](#installation)
 - [Dependencies](#dependencies)
 - [Basic Configuration](#basic-configuration)
-- [Security — HMAC-SHA256 (v1.1.0)](#security--hmac-sha256-v110)
+- [Security — HMAC-SHA256 (v1.2.0)](#security--hmac-sha256-v110)
 - [Standard MQTT Configuration](#standard-mqtt-configuration)
 - [MQTTS (Secure) Configuration](#mqtts-secure-configuration)
 - [Message Formats](#message-formats)
@@ -33,9 +33,9 @@
 
 ---
 
-## What's New in v1.1.0
+## What's New in v1.2.0
 
-This release resolves **8 issues** identified in a technical audit of v1.0.1. All changes are backward-compatible unless noted.
+This release resolves **8 issues** identified in a technical audit of v1.1.0. All changes are backward-compatible unless noted.
 
 ###  Security fixes
 
@@ -60,11 +60,11 @@ This release resolves **8 issues** identified in a technical audit of v1.0.1. Al
 | **#7** | `_setState()` was only called in a few places — `getCurrentState()` returned stale values | `_setState()` is now called at every transition: `IDLE → RECEIVING → DECODING → VALIDATING → WRITING → COMPLETING → SUCCESS/ERROR` |
 | **#8** | `esp_ota_mark_app_valid_cancel_rollback()` was never called automatically | Called in `begin()` whenever the running partition is an OTA partition |
 
-###  Breaking behavior change (v1.1.0)
+###  Breaking behavior change (v1.2.0)
 
 > In v1.0.1 the device restarted automatically via a blocking `delay()+ESP.restart()` after a successful OTA.
 >
-> In v1.1.0 the restart is **non-blocking** and is driven by a timer polled in `handle()`. If you do not call `handle()` in your `loop()`, the device will **not** restart automatically after OTA.
+> In v1.2.0 the restart is **non-blocking** and is driven by a timer polled in `handle()`. If you do not call `handle()` in your `loop()`, the device will **not** restart automatically after OTA.
 >
 > **Action required:** Ensure `ota.handle()` is called every `loop()` iteration.
 
@@ -79,7 +79,7 @@ void loop() {
 
 ## Overview
 
-MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both single-message and chunked firmware transfers, integrates directly with the ESP-IDF OTA partition API (`esp_ota_ops.h`), and since v1.1.0 provides real cryptographic verification with SHA-256 and HMAC-SHA256 via mbedtls (bundled with ESP32 Arduino).
+MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both single-message and chunked firmware transfers, integrates directly with the ESP-IDF OTA partition API (`esp_ota_ops.h`), and since v1.2.0 provides real cryptographic verification with SHA-256 and HMAC-SHA256 via mbedtls (bundled with ESP32 Arduino).
 
 ---
 
@@ -90,7 +90,7 @@ MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both sin
 - **Chunked OTA** — Fragmented transfer for large firmware files with strict sequence validation
 - **Native ESP-IDF OTA** — Uses `esp_ota_begin/write/end` directly; no dependency on `Update.h` layer
 
-### Security (v1.1.0)
+### Security (v1.2.0)
 - **MQTTS** — Encrypted transport via TLS (delegated to the external MQTT client)
 - **Real SHA-256** — Integrity digest computed with `mbedtls_sha256` on every chunk
 - **Real HMAC-SHA256** — Firmware origin authentication via `setSecurityKey()` + `requireSignature()`
@@ -101,7 +101,7 @@ MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both sin
 - **9-state machine** — `IDLE → RECEIVING → DECODING → VALIDATING → WRITING → COMPLETING → SUCCESS/ERROR/ABORTED`
 - **Event callbacks** — `onProgress`, `onError`, `onSuccess`, `onStateChange`
 - **OTA statistics** — bytes, chunk count, error count, average speed (KB/s)
-- **Non-blocking restart** (v1.1.0) — restart scheduled after OTA without blocking `loop()`
+- **Non-blocking restart** (v1.2.0) — restart scheduled after OTA without blocking `loop()`
 
 ---
 
@@ -128,8 +128,8 @@ lib_deps =
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>        // v6.19+ (ArduinoJson v7 not yet tested)
 #include <Update.h>
-#include <mbedtls/sha256.h>     // v1.1.0 — bundled with ESP32 Arduino, no extra install
-#include <mbedtls/md.h>         // v1.1.0 — bundled with ESP32 Arduino, no extra install
+#include <mbedtls/sha256.h>     // v1.2.0 — bundled with ESP32 Arduino, no extra install
+#include <mbedtls/md.h>         // v1.2.0 — bundled with ESP32 Arduino, no extra install
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
 #include "esp_partition.h"
@@ -140,7 +140,7 @@ lib_deps =
 ### Configuration macros (override before `#include "MQTTOTA.h"`)
 
 ```cpp
-#define MQTT_OTA_JSON_SIZE       8192   // Stack size for JSON parser (v1.1.0: was 32768 heap)
+#define MQTT_OTA_JSON_SIZE       8192   // Stack size for JSON parser (v1.2.0: was 32768 heap)
 #define MQTT_OTA_BUFFSIZE        1024   // Write buffer per chunk
 #define MQTT_OTA_TIMEOUT_MS    420000  // Total OTA timeout (7 min)
 #define MQTT_OTA_MAX_CHUNK_SIZE 65536  // Max decoded bytes per MQTT chunk
@@ -165,7 +165,7 @@ void setup() {
     Serial.begin(115200);
     ota.begin("MyDevice", "1.0.0");
     // begin() also calls esp_ota_mark_app_valid_cancel_rollback()
-    // automatically when running from an OTA partition (v1.1.0)
+    // automatically when running from an OTA partition (v1.2.0)
 }
 
 void loop() {
@@ -175,9 +175,9 @@ void loop() {
 
 ---
 
-## Security — HMAC-SHA256 (v1.1.0)
+## Security — HMAC-SHA256 (v1.2.0)
 
-v1.1.0 adds real firmware authentication. Without a configured key the behavior is identical to v1.0.1 (backward compatible).
+v1.2.0 adds real firmware authentication. Without a configured key the behavior is identical to v1.0.1 (backward compatible).
 
 ### Enabling HMAC verification
 
@@ -210,16 +210,8 @@ print(sig)   # 64-char hex string → include in OTA message
 ### Manual verification in your code
 
 ```cpp
-// Verify a payload before passing it to processMessage()
-const uint8_t* rawBytes = /* decoded firmware */;
-size_t rawLen = /* size */;
-String expectedHmac = "64-char-hex-from-server";
-
-if (ota.verifyFirmwareSignature(rawBytes, rawLen, expectedHmac)) {
-    Serial.println("Firmware authenticated");
-} else {
-    Serial.println("HMAC mismatch — firmware rejected");
-}
+// Legacy overload — backward compat, does not compute HMAC without raw data
+bool verifyFirmwareSignature(const String& signature);
 ```
 
 ---
@@ -318,7 +310,7 @@ void setup() {
     ota.begin("MySecureDevice", "1.0.0");
     // Recommended in production:
     ota.setSecurityKey("production-hmac-secret-key-here");
-    ota.requireSignature(true);
+    ota.setSecurityMode(SECURITY_HMAC_SHA256);
 
     ota.setMQTTConfig(
         [](const char* t, const String& m) { mqttClient.publish(t, m.c_str()); },
@@ -355,12 +347,15 @@ void loop() {
 {
   "EventType": "UpdateFirmwareDevice",
   "Details": {
-    "FirmwareVersion": "1.1.0",
+    "FirmwareVersion": "1.2.0",
     "Base64Part": "<chunk_base64>",
     "PartIndex": 1,
     "TotalParts": 10,
     "IsError": false,
-    "ErrorMessage": null
+    "ErrorMessage": null,
+    "sha256": "<expected_sha256_hex>",
+    "hmac_sig": "<expected_hmac_hex>",
+    "ecdsa_sig": "<expected_ecdsa_base64>"
   }
 }
 ```
@@ -391,7 +386,7 @@ void loop() {
 void setup() {
     ota.begin("MyDevice", "2.0.0");
 
-    // Security (v1.1.0)
+    // Security (v1.2.0)
     ota.setSecurityKey("your-shared-secret");
     ota.requireSignature(true);
 
@@ -427,7 +422,7 @@ void loop() {
     static unsigned long lastCheck = 0;
     if (millis() - lastCheck > 30000) {
         MQTTOTA::logMemoryStatus();         // free/min/maxAlloc heap
-        Serial.printf("OTA space: %zu B\n", ota.getFreeOTASpace()); // v1.1.0
+        Serial.printf("OTA space: %zu B\n", ota.getFreeOTASpace()); // v1.2.0
         lastCheck = millis();
     }
 
@@ -481,7 +476,7 @@ ota.onError([](const String& error, const String& version) {
 });
 ```
 
-### OTA state machine (v1.1.0)
+### OTA state machine (v1.2.0)
 
 ```
 IDLE
@@ -502,16 +497,16 @@ IDLE
 
 ```cpp
 void begin(const String& deviceName, const String& firmwareVersion);
-// Also calls esp_ota_mark_app_valid_cancel_rollback() on OTA partitions (v1.1.0)
+// Also calls esp_ota_mark_app_valid_cancel_rollback() on OTA partitions (v1.2.0)
 
 void handle();
-// REQUIRED every loop() — drives restart timer and timeout watchdog (v1.1.0)
+// REQUIRED every loop() — drives restart timer and timeout watchdog (v1.2.0)
 
 void setMQTTConfig(publishFn, isConnectedFn, otaTopic = "ota");
 void setPartitionName(const String& partitionName = "");
 ```
 
-### Security (v1.1.0)
+### Security (v1.2.0)
 
 ```cpp
 void setSecurityKey(const char* key);      // Set HMAC-SHA256 key (max 64 bytes)
@@ -546,14 +541,14 @@ void abortUpdate();
 ### Status & Query
 
 ```cpp
-bool      isUpdateInProgress() const;  // v1.1.0: single source of truth
+bool      isUpdateInProgress() const;  // v1.2.0: single source of truth
 bool      isValidating()       const;
 bool      isWriting()          const;
 OTAState  getCurrentState();           // Full 9-state enum
 int       getProgress();
 String    getCurrentVersion();
 String    getDeviceID();
-size_t    getFreeOTASpace();           // v1.1.0: was commented out
+size_t    getFreeOTASpace();           // v1.2.0: was commented out
 OTAStatistics getStatistics();         // bytes, chunks, errors, avgSpeed
 String    getBootPartitionInfo();
 void      printDiagnostics();
@@ -638,7 +633,7 @@ ota.onError([](const String& error, const String& version) {
 // Transport encryption
 wifiClient.setCACert(rootCA);
 
-// Firmware authentication (v1.1.0)
+// Firmware authentication (v1.2.0)
 ota.setSecurityKey("production-secret-min-32-chars");
 ota.requireSignature(true);
 ```
@@ -674,7 +669,7 @@ ota.printDiagnostics();
 
 ## Complete Workflows
 
-### Successful chunked OTA (v1.1.0 flow)
+### Successful chunked OTA (v1.2.0 flow)
 
 ```
 Backend                          ESP32 Device

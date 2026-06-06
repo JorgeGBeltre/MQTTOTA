@@ -73,6 +73,8 @@ String MQTTOTA::base64Encode(const String &input) {
 
 MQTTOTA::MQTTOTA() {
   memset(_hmacKey, 0, sizeof(_hmacKey));
+  mbedtls_sha256_init(&_otaContext.sha256_ctx);
+  mbedtls_md_init(&_otaContext.hmacCtx);
   _deviceID = _generateDeviceID();
 
   _otaContext.inProgress = false;
@@ -139,10 +141,23 @@ void MQTTOTA::setSecurityKey(const char *key) {
   Serial.printf("[MQTTOTA] Security key set (%zu bytes)\n", _hmacKeyLen);
 }
 
+void MQTTOTA::setPublicKey(const char *pemKey) {
+  if (pemKey) {
+    _publicKey = String(pemKey);
+    Serial.println("[MQTTOTA] ECDSA Public Key set");
+  }
+}
+
+void MQTTOTA::setSecurityMode(OTASecurityMode mode) {
+  _securityMode = mode;
+  Serial.printf("[MQTTOTA] Security mode set to: %d\n", _securityMode);
+}
+
 void MQTTOTA::requireSignature(bool required) {
   _requireSig = required;
-  Serial.printf("[MQTTOTA] Signature requirement: %s\n",
-                required ? "ON" : "off");
+  _securityMode = required ? SECURITY_SHA256 : SECURITY_NONE;
+  Serial.printf("[MQTTOTA] Signature requirement: %s (mapped to mode %d)\n",
+                required ? "ON" : "OFF", _securityMode);
 }
 
 // Callback registration
@@ -310,6 +325,9 @@ void MQTTOTA::_processOTAChunk(const String &message) {
   chunk.totalParts = details["TotalParts"] | 0;
   chunk.isError = details["IsError"] | false;
   chunk.errorMessage = details["ErrorMessage"] | "";
+  chunk.checksum = details["checksum"] | details["sha256"] | "";
+  chunk.hmacSig = details["hmac_sig"] | "";
+  chunk.ecdsaSig = details["ecdsa_sig"] | "";
 
   if (chunk.isError) {
     Serial.printf("[MQTTOTA] Sender error: %s\n", chunk.errorMessage.c_str());
@@ -391,12 +409,35 @@ bool MQTTOTA::_startChunkedOTA(const OTAChunkData &chunk) {
 
   _otaContext.inProgress = true;
   _otaContext.firmwareVersion = chunk.firmwareVersion;
+  _otaContext.expectedSha256 = chunk.checksum;
+  _otaContext.expectedHmac = chunk.hmacSig;
+  _otaContext.expectedEcdsa = chunk.ecdsaSig;
   _otaContext.currentPart = 0;
   _otaContext.totalParts = chunk.totalParts;
+  _otaContext.sha256_finished = false;
   _otaContext.startTime = millis();
   _otaContext.receivedSize = 0;
   _otaContext.retryCount = 0;
   _otaContext.pendingRestart = false;
+
+  // Init incremental SHA-256
+  mbedtls_sha256_init(&_otaContext.sha256_ctx);
+  mbedtls_sha256_starts(&_otaContext.sha256_ctx, 0); // 0 = SHA-256 (not SHA-224)
+  _otaContext.sha256_active = true;
+
+  _otaContext.hmac_active = false;
+  if (_hmacKeyLen > 0) {
+    const mbedtls_md_info_t *mdInfo =
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_init(&_otaContext.hmacCtx);
+    if (mbedtls_md_setup(&_otaContext.hmacCtx, mdInfo, 1) == 0) { // 1 = HMAC mode
+      mbedtls_md_hmac_starts(&_otaContext.hmacCtx, _hmacKey, _hmacKeyLen);
+      _otaContext.hmac_active = true;
+    } else {
+      Serial.println("[MQTTOTA] WARN: HMAC context setup failed");
+      mbedtls_md_free(&_otaContext.hmacCtx);
+    }
+  }
 
   _stats.startTime = millis();
   _stats.chunkCount = 0;
@@ -437,6 +478,14 @@ bool MQTTOTA::_processChunkData(const OTAChunkData &chunk) {
       return false;
     }
     Serial.println("[MQTTOTA] Image header OK");
+  }
+
+  if (_otaContext.sha256_active) {
+    mbedtls_sha256_update(&_otaContext.sha256_ctx, (const uint8_t*)decodedData.c_str(), decodedData.length());
+  }
+
+  if (_otaContext.hmac_active) {
+    mbedtls_md_hmac_update(&_otaContext.hmacCtx, (const uint8_t*)decodedData.c_str(), decodedData.length());
   }
 
   _setState(OTA_STATE_WRITING);
@@ -485,21 +534,63 @@ void MQTTOTA::_completeChunkedOTA(const OTAChunkData &chunk) {
 
   _setState(OTA_STATE_VALIDATING);
 
-  // SHA-256 / HMAC verification (if checksum provided in chunk)
-  if (!chunk.checksum.isEmpty()) {
-    String computed = _calculateSHA256(
-        (const uint8_t *)chunk.base64Part.c_str(), chunk.base64Part.length());
-    if (!computed.equalsIgnoreCase(chunk.checksum)) {
-      Serial.printf(
-          "[MQTTOTA] SHA-256 mismatch\n  expected: %s\n  computed: %s\n",
-          chunk.checksum.c_str(), computed.c_str());
-      _publishError("SHA-256 mismatch — firmware rejected",
-                    chunk.firmwareVersion);
+  _finishSha256Digest(); // finalize the digest once
+
+  if (_securityMode == SECURITY_ECDSA_SHA256) {
+    if (_otaContext.expectedEcdsa.isEmpty()) {
+      _publishError("No ecdsa_sig provided for SECURITY_ECDSA_SHA256", chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    if (!_verifyEcdsaFinal(_otaContext.expectedEcdsa)) {
+      _publishError("ECDSA signature mismatch — firmware rejected", chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    Serial.println("[MQTTOTA] ECDSA Signature OK");
+  } else if (_securityMode == SECURITY_HMAC_SHA256) {
+    if (_otaContext.expectedHmac.isEmpty() || _hmacKeyLen == 0) {
+      _publishError("No hmac_sig or key provided for SECURITY_HMAC_SHA256", chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    if (!_verifyHmacFinal(_otaContext.expectedHmac)) {
+      _publishError("HMAC mismatch — firmware rejected", chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    Serial.println("[MQTTOTA] HMAC OK");
+  } else if (_securityMode == SECURITY_SHA256) {
+    if (_otaContext.expectedSha256.isEmpty()) {
+      _publishError("No sha256 provided for SECURITY_SHA256", chunk.firmwareVersion);
+      _cleanupChunkedOTA();
+      _setState(OTA_STATE_ERROR);
+      return;
+    }
+    if (!_verifySha256Final(_otaContext.expectedSha256)) {
+      _publishError("SHA-256 mismatch — firmware rejected", chunk.firmwareVersion);
       _cleanupChunkedOTA();
       _setState(OTA_STATE_ERROR);
       return;
     }
     Serial.println("[MQTTOTA] SHA-256 OK");
+  } else {
+    // SECURITY_NONE: check SHA-256 if provided, otherwise accept
+    if (!_otaContext.expectedSha256.isEmpty()) {
+      if (!_verifySha256Final(_otaContext.expectedSha256)) {
+        _publishError("SHA-256 mismatch (dev mode) — firmware rejected", chunk.firmwareVersion);
+        _cleanupChunkedOTA();
+        _setState(OTA_STATE_ERROR);
+        return;
+      }
+      Serial.println("[MQTTOTA] SHA-256 OK (dev mode)");
+    } else {
+      Serial.println("[MQTTOTA] No signature required (SECURITY_NONE)");
+    }
   }
 
   esp_err_t err = esp_ota_end(_otaContext.update_handle);
@@ -541,6 +632,17 @@ void MQTTOTA::_completeChunkedOTA(const OTAChunkData &chunk) {
 
   _otaContext.inProgress = false;
 
+  if (_otaContext.sha256_active) {
+    mbedtls_sha256_free(&_otaContext.sha256_ctx);
+    _otaContext.sha256_active = false;
+    _otaContext.sha256_finished = false;
+  }
+
+  if (_otaContext.hmac_active) {
+    mbedtls_md_free(&_otaContext.hmacCtx);
+    _otaContext.hmac_active = false;
+  }
+
   // non-blocking restart
   if (_autoReset) {
     _otaContext.pendingRestart = true;
@@ -559,6 +661,17 @@ void MQTTOTA::_cleanupChunkedOTA() {
       Serial.println("[MQTTOTA] OTA aborted");
     }
     _otaContext.update_handle = 0;
+  }
+
+  if (_otaContext.sha256_active) {
+    mbedtls_sha256_free(&_otaContext.sha256_ctx);
+    _otaContext.sha256_active = false;
+    _otaContext.sha256_finished = false;
+  }
+
+  if (_otaContext.hmac_active) {
+    mbedtls_md_free(&_otaContext.hmacCtx);
+    _otaContext.hmac_active = false;
   }
 
   _otaContext.inProgress = false;
@@ -1086,6 +1199,97 @@ void MQTTOTA::_printSHA256(const uint8_t *image_hash, const char *label) {
     sprintf(&hash_print[i * 2], "%02x", image_hash[i]);
   }
   Serial.printf("%s: %s\n", label, hash_print);
+}
+
+// Finalize security digests and verify
+
+void MQTTOTA::_finishSha256Digest() {
+  if (!_otaContext.sha256_active || _otaContext.sha256_finished) return;
+  mbedtls_sha256_finish(&_otaContext.sha256_ctx, _otaContext.finalDigest);
+  _otaContext.sha256_finished = true;
+}
+
+bool MQTTOTA::_verifySha256Final(const String &expectedHex) {
+  if (!_otaContext.sha256_active || !_otaContext.sha256_finished)
+    return false;
+
+  char hex[MQTT_OTA_HASH_LEN * 2 + 1];
+  for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
+    snprintf(&hex[i * 2], 3, "%02x", _otaContext.finalDigest[i]);
+  }
+
+  bool ok = (expectedHex.equalsIgnoreCase(String(hex)));
+  if (!ok) {
+    Serial.printf(
+        "[MQTTOTA] SHA-256 MISMATCH\n  expected: %s\n  computed: %s\n",
+        expectedHex.c_str(), hex);
+  }
+  return ok;
+}
+
+bool MQTTOTA::_verifyHmacFinal(const String &expectedHex) {
+  if (!_otaContext.hmac_active)
+    return false;
+
+  uint8_t digest[MQTT_OTA_HASH_LEN];
+  mbedtls_md_hmac_finish(&_otaContext.hmacCtx, digest);
+
+  char hex[MQTT_OTA_HASH_LEN * 2 + 1];
+  for (int i = 0; i < MQTT_OTA_HASH_LEN; ++i) {
+    snprintf(&hex[i * 2], 3, "%02x", digest[i]);
+  }
+
+  bool ok = expectedHex.equalsIgnoreCase(String(hex));
+  if (!ok) {
+    Serial.printf("[MQTTOTA] HMAC MISMATCH\n  expected: %s\n  computed: %s\n",
+                  expectedHex.c_str(), hex);
+  }
+  return ok;
+}
+
+bool MQTTOTA::_verifyEcdsaFinal(const String &expectedSigBase64) {
+  if (!_otaContext.sha256_active || !_otaContext.sha256_finished || _publicKey.isEmpty()) {
+    return false;
+  }
+
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+
+  // Parse public key
+  int ret = mbedtls_pk_parse_public_key(&pk, (const unsigned char *)_publicKey.c_str(), _publicKey.length() + 1);
+  if (ret != 0) {
+    Serial.printf("[MQTTOTA] mbedtls_pk_parse_public_key failed: -0x%04x\n", -ret);
+    mbedtls_pk_free(&pk);
+    return false;
+  }
+
+  // Decode Base64 signature
+  size_t sigLen = calculateBase64DecodedSize(expectedSigBase64);
+  uint8_t* sigBuf = (uint8_t*)malloc(sigLen + 4);
+  if (!sigBuf) {
+    mbedtls_pk_free(&pk);
+    return false;
+  }
+  
+  String decodedSig = base64Decode(expectedSigBase64);
+  if (decodedSig.isEmpty()) {
+    free(sigBuf);
+    mbedtls_pk_free(&pk);
+    return false;
+  }
+  memcpy(sigBuf, decodedSig.c_str(), decodedSig.length());
+
+  // Verify signature
+  ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, _otaContext.finalDigest, sizeof(_otaContext.finalDigest), sigBuf, decodedSig.length());
+  free(sigBuf);
+  mbedtls_pk_free(&pk);
+
+  if (ret != 0) {
+    Serial.printf("[MQTTOTA] mbedtls_pk_verify failed: -0x%04x\n", -ret);
+    return false;
+  }
+
+  return true;
 }
 
 String MQTTOTA::_generateDeviceID() {

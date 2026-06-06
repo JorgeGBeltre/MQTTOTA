@@ -11,6 +11,7 @@
 #include <WiFiClientSecure.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/pk.h>
 
 extern "C" {
 #include "libb64/cdecode.h"
@@ -70,6 +71,14 @@ typedef std::function<void(const String &error, const String &version)>
 typedef std::function<void(const String &version)> MQTTOTASuccessCallback;
 typedef std::function<void(uint8_t state)> MQTTOTAStateCallback;
 
+// Security Modes
+enum OTASecurityMode : uint8_t {
+  SECURITY_NONE = 0,
+  SECURITY_SHA256 = 1,
+  SECURITY_HMAC_SHA256 = 2,
+  SECURITY_ECDSA_SHA256 = 3
+};
+
 // OTA States
 
 enum OTAState {
@@ -119,6 +128,8 @@ public:
   // Security
 
   void setSecurityKey(const char *key);
+  void setPublicKey(const char *pemKey);
+  void setSecurityMode(OTASecurityMode mode);
 
   void requireSignature(bool required = true);
 
@@ -206,6 +217,19 @@ private:
     // Non-blocking restart
     bool pendingRestart = false;
     unsigned long restartAt = 0;
+
+    // Security context
+    mbedtls_sha256_context sha256_ctx;
+    bool sha256_active = false;
+    bool sha256_finished = false;
+    uint8_t finalDigest[32];
+
+    mbedtls_md_context_t hmacCtx;
+    bool hmac_active = false;
+
+    String expectedSha256;
+    String expectedHmac;
+    String expectedEcdsa;
   };
 
   struct OTAChunkData {
@@ -216,6 +240,8 @@ private:
     bool isError = false;
     String errorMessage;
     String checksum;
+    String hmacSig;
+    String ecdsaSig;
     size_t decodedSize = 0;
   };
 
@@ -230,9 +256,11 @@ private:
   OTAStatistics _stats;
   int _currentProgress = 0;
 
-  // HMAC-SHA256 security
+  // HMAC-SHA256 and Security
   uint8_t _hmacKey[MQTT_OTA_HMAC_KEY_SIZE];
   size_t _hmacKeyLen = 0;
+  String _publicKey;
+  OTASecurityMode _securityMode = SECURITY_NONE;
   bool _requireSig = false; // false = backward-compatible default
 
   // Callbacks
@@ -281,6 +309,12 @@ private:
   static bool _processImageHeader(const uint8_t *data, size_t data_len);
   static String _calculateSHA256(const uint8_t *data, size_t length);
   String _hmacSha256Hex(const uint8_t *data, size_t len) const;
+  
+  void _finishSha256Digest();
+  bool _verifySha256Final(const String &expectedHex);
+  bool _verifyHmacFinal(const String &expectedHex);
+  bool _verifyEcdsaFinal(const String &expectedSigBase64);
+
   String _generateDeviceID();
 
   // State management
