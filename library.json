@@ -1,0 +1,27 @@
+{
+  "name": "MQTTOTA",
+  "version": "1.2.0",
+  "description": "Secure OTA firmware updates via MQTT/MQTTS for ESP32 with real SHA-256, HMAC-SHA256, ECDSA-SHA256, and non-blocking restart.",
+  "keywords": [
+    "mqtt",
+    "ota",
+    "esp32",
+    "update",
+    "secure"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JorgeGBeltre/MQTTOTA"
+  },
+  "authors": [
+    {
+      "name": "Jorge Gaspar Beltre Rivera",
+      "maintainer": true
+    }
+  ],
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "bblanchon/ArduinoJson": "^6.19.0"
+  }
+}
