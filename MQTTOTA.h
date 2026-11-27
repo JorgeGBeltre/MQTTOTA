@@ -1,5 +1,6 @@
 #ifndef MQTT_OTA_SDK_H
 #define MQTT_OTA_SDK_H
+#define MQTT_OTA_VERSION "1.2.1"
 
 #include "esp_app_format.h"
 #include "esp_ota_ops.h"

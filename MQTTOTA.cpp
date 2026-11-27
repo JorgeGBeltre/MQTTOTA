@@ -206,7 +206,7 @@ void MQTTOTA::processMessage(const String &topic, const String &message) {
   if (topic != _otaTopic)
     return;
 
-  if (isUpdateInProgress()) {
+  if (!_chunkedOTAEnabled && isUpdateInProgress()) {
     Serial.println("[MQTTOTA] OTA in progress — ignoring new message");
     return;
   }
@@ -336,8 +336,10 @@ void MQTTOTA::_processOTAChunk(const String &message) {
     return;
   }
 
-  if (chunk.base64Part.isEmpty() || chunk.firmwareVersion.isEmpty()) {
-    _publishError("Incomplete chunk data", chunk.firmwareVersion);
+  if (chunk.base64Part.isEmpty() || chunk.firmwareVersion.isEmpty() ||
+      chunk.totalParts <= 0 || chunk.partIndex <= 0 ||
+      chunk.partIndex > chunk.totalParts) {
+    _publishError("Incomplete or out-of-bounds chunk data", chunk.firmwareVersion);
     _cleanupChunkedOTA();
     return;
   }
@@ -505,7 +507,7 @@ bool MQTTOTA::_processChunkData(const OTAChunkData &chunk) {
   // Update stats
   unsigned long elapsed = millis() - _otaContext.startTime;
   if (elapsed > 0) {
-    _stats.avgSpeedBps = (_otaContext.receivedSize * 1000.0f) / (float)elapsed;
+    _stats.averageSpeed = (_otaContext.receivedSize * 1000.0f) / (float)elapsed;
   }
   _stats.receivedBytes = _otaContext.receivedSize;
   _stats.chunkCount++;
@@ -977,8 +979,8 @@ bool MQTTOTA::verifyFirmwareSignature(const uint8_t *data, size_t len,
   }
   if (_hmacKeyLen == 0) {
     Serial.println(
-        "[MQTTOTA] WARNING: signature provided but no key set — skipping");
-    return true;
+        "[MQTTOTA] ERROR: signature verification requested without configured HMAC key");
+    return false;
   }
 
   String computed = _hmacSha256Hex(data, len);

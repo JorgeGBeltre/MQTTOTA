@@ -11,6 +11,7 @@
 
 ## Table of Contents
 
+- [What's New in v1.2.1](#whats-new-in-v121)
 - [What's New in v1.2.0](#whats-new-in-v110)
 - [Overview](#overview)
 - [Key Features](#key-features)
@@ -31,6 +32,14 @@
 - [Broker Compatibility](#broker-compatibility)
 - [License](#license)
 - [Contact](#contact)
+
+---
+
+## What's New in v1.2.1
+
+- **Multi-chunk progression fix**: Allows subsequent fragments (`part >= 2`) to proceed in `processMessage()` while `_chunkedOTAEnabled` is active instead of aborting on `isUpdateInProgress()`, while still guarding `totalParts > 0`.
+- **Fail-closed signature verification**: `verifyFirmwareSignature()` now returns `false` when `_requireSig` or `SECURITY_HMAC_SHA256` is enabled and no HMAC key (`_hmacKeyLen == 0`) has been configured.
+- **Build & manifest synchronization**: Fixed `OTAStatistics::averageSpeed` member reference in `_completeChunkedOTA()`, added `#define MQTT_OTA_VERSION "1.2.1"` in `MQTTOTA.h`, and synchronized `library.properties` and `library.json` to `1.2.1`.
 
 ---
 
@@ -94,7 +103,8 @@ MQTTOTA is a robust SDK designed for ESP32 IoT deployments. It supports both sin
 ### Security (v1.2.0)
 - **MQTTS** — Encrypted transport via TLS (delegated to the external MQTT client)
 - **Real SHA-256** — Integrity digest computed with `mbedtls_sha256` on every chunk
-- **Real HMAC-SHA256** — Firmware origin authentication via `setSecurityKey()` + `requireSignature()`
+- **Real HMAC-SHA256** — Firmware origin authentication via `setSecurityKey()` + `requireSignature()` (fails closed when signature verification is required without a configured HMAC key)
+- **Validated Chunked Progression** — Accepts subsequent fragments (`part >= 2`) while `_chunkedOTAEnabled` is active, enforces `totalParts > 0` bounds, and tracks transfer throughput via `_stats.averageSpeed`
 - **Image header verification** — Validates ESP32 magic number and segment count before writing
 - **Configurable timeout** — 7-minute watchdog cancels hung updates
 
